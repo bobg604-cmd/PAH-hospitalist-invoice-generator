@@ -1228,7 +1228,7 @@ def render_form(
           </label>
         </div>
         <div class="section-title">Clinical Admin</div>
-        <p class="hint">These checkboxes apply once in general by shift type. If the 15-minute add-on would overlap another billed interval, it is skipped automatically.</p>
+        <p class="hint">Checking a box adds one extra 15-minute clinical admin billing entry after each shift of that type. If the 15-minute add-on would overlap another billed interval, it is skipped automatically.</p>
         <div class="checks">
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="scheduled"{checked('scheduled')}>Scheduled / Team</label>
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="evening"{checked('evening')}>Evening</label>
