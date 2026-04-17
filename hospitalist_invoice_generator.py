@@ -1201,7 +1201,7 @@ def render_form(
           </label>
           <label>Name on Master Schedule
             <input name="schedule_name" value="{field('schedule_name')}" required>
-            <span class="hint">Usually last name.</span>
+            <span class="hint">Match the spreadsheet exactly. Usually last name only, unless the schedule uses a more specific name like "Johal, S".</span>
           </label>
         </div>
         <label>Extra Schedule Aliases
