@@ -327,16 +327,54 @@ def split_aliases(raw_aliases: Iterable[str]) -> list[str]:
     return aliases
 
 
+def schedule_name_is_specific(value: str) -> bool:
+    tokens = tokenize(value)
+    normalized = normalize_text(value)
+    return len(tokens) > 1 or "," in normalized or "." in normalized
+
+
+def schedule_name_matches_person(
+    schedule_name: str,
+    first_name: str,
+    last_name: str,
+    physician_name: str,
+) -> bool:
+    schedule_name = schedule_name.strip()
+    if not schedule_name:
+        return False
+    full_name = f"{first_name} {last_name}".strip()
+    return any(
+        [
+            alias_in_text(schedule_name, physician_name),
+            alias_in_text(schedule_name, full_name),
+            alias_in_text(schedule_name, last_name),
+            alias_in_text(last_name, schedule_name),
+        ]
+    )
+
+
 def derive_default_aliases(first_name: str, last_name: str, physician_name: str, schedule_name: str | None) -> list[str]:
     aliases: list[str] = []
-    candidates = [
-        schedule_name or "",
-        physician_name,
-        f"{first_name} {last_name}".strip(),
-        last_name,
-        f"{last_name}, {first_name[:1]}." if first_name else "",
-        f"{last_name}, {first_name[:1]}" if first_name else "",
-    ]
+    schedule_name = (schedule_name or "").strip()
+    candidates = [schedule_name]
+    if not schedule_name or schedule_name_matches_person(schedule_name, first_name, last_name, physician_name):
+        candidates.extend([physician_name, f"{first_name} {last_name}".strip()])
+    if not schedule_name and last_name:
+        candidates.extend(
+            [
+                last_name,
+                f"{last_name}, {first_name[:1]}." if first_name else "",
+                f"{last_name}, {first_name[:1]}" if first_name else "",
+            ]
+        )
+    elif schedule_name_matches_person(schedule_name, first_name, last_name, physician_name) and not schedule_name_is_specific(schedule_name):
+        candidates.extend(
+            [
+                last_name,
+                f"{last_name}, {first_name[:1]}." if first_name else "",
+                f"{last_name}, {first_name[:1]}" if first_name else "",
+            ]
+        )
     for candidate in candidates:
         candidate = candidate.strip()
         if candidate and candidate not in aliases:
