@@ -142,7 +142,8 @@ This project can be hosted on Railway so users can open a website instead of ins
 On Railway:
 
 - users open a website instead of double-clicking the `.bat` file
-- users should upload the blank invoice template in the form
+- the bundled invoice template is used automatically
+- users can still upload a template in the form if they want to override the default
 - users then download the finished workbook from the results page
 
 They do not need Python installed on their computer.
@@ -174,13 +175,15 @@ Typical setup:
 ### Notes For Hosting
 
 - Railway storage is not permanent, so users should download files right away.
-- The template workbook should be uploaded in the form instead of using a local Windows file path.
+- The app includes a bundled default template for normal use.
+- The upload field can be used to temporarily override the bundled template.
 - If you want login protection later, that can be added as a separate improvement.
 
 ## Files In This Project
 
 - `hospitalist_invoice_generator.py`: the main app
 - `Start Hospitalist Invoice App.bat`: the easiest way to launch it
+- `templates/`: bundled invoice template files used by default
 - `requirements.txt`: Python dependencies for deployment
 - `Procfile`: tells Railway how to start the web app
 - `outputs`: where finished invoice files are saved

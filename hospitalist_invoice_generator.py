@@ -47,7 +47,7 @@ DEFAULT_MASTER_URL = (
     "1DlDnljstmxsqgJyKTU0eWdl4-YBRQvm3eaE7PENVVRE/edit?gid=61161592"
 )
 DEFAULT_TEMPLATE = Path(
-    r"C:\Users\bobg6\Downloads\FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx"
+    BASE_DIR / "templates" / "FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx"
 )
 START_ROW = 18
 END_ROW = 217
@@ -1205,13 +1205,14 @@ def render_form(
         <label>Template Workbook Upload
           <input name="template_file" type="file" accept=".xlsx,.xlsm,.xltx,.xltm">
         </label>
-        <p class="hint">For Railway or any hosted website, upload the blank invoice template here. On your own computer, you can still use a local file path instead.</p>
+        <p class="hint">A bundled template is used automatically. Upload a file here only if you want to override it for this one run.</p>
         <label>Template Workbook Path
           <input name="template" value="{field('template', str(DEFAULT_TEMPLATE))}">
         </label>
         <label>Master Schedule URL
           <input name="master_url" value="{field('master_url', DEFAULT_MASTER_URL)}" required>
         </label>
+        <p class="hint">Leave the template path as-is unless you want to point to a different workbook on your own computer.</p>
         <div class="actions">
           <button type="submit">Generate Workbook</button>
           <button class="ghost" type="button" onclick="window.location='/'">Reset</button>
@@ -1269,7 +1270,9 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
         raise ValueError("Month must be between 1 and 12.")
 
     template_raw = collect_form_value(data, "template", str(DEFAULT_TEMPLATE))
-    template_path = uploaded_template_path or Path(template_raw) if template_raw else uploaded_template_path
+    template_path = uploaded_template_path or (Path(template_raw) if template_raw else None)
+    if template_path is None and DEFAULT_TEMPLATE.exists():
+        template_path = DEFAULT_TEMPLATE
     if template_path is None:
         raise ValueError("Please upload a template workbook or enter a local template path.")
     master_url = collect_form_value(data, "master_url", DEFAULT_MASTER_URL)
