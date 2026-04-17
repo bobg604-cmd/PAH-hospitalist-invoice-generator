@@ -46,7 +46,7 @@ DEFAULT_MASTER_URL = (
     "1DlDnljstmxsqgJyKTU0eWdl4-YBRQvm3eaE7PENVVRE/edit?gid=61161592"
 )
 DEFAULT_TEMPLATE = Path(
-    r"C:\Users\bobg6\OneDrive\Documents\fh afterhours forms\hospitalist invoices\Mar 2026 1st half.xlsx"
+    r"C:\Users\bobg6\Downloads\FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx"
 )
 START_ROW = 18
 END_ROW = 217
@@ -457,6 +457,26 @@ def row_matches_aliases(row_value: str, aliases: list[str]) -> bool:
     return bool(row_value and any(alias_in_text(alias, row_value) for alias in aliases))
 
 
+def shift_note_for_definition(definition: ShiftDefinition) -> str | None:
+    if definition in TEAM_SHIFTS:
+        return definition.label
+    if definition is ADMIT_SHIFT:
+        return "Admit Pilot"
+    if definition is VIRTUAL_SHIFT:
+        return "Virtual"
+    if definition is EVENING_SHIFT:
+        return "Evening"
+    return None
+
+
+def overnight_note(source_date: date, includes_evening: bool = False) -> str:
+    month_label = source_date.strftime("%b")
+    base = f"Overnight ({month_label} {source_date.day})"
+    if includes_evening:
+        return f"Evening + {base}"
+    return base
+
+
 def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, month: int, period: str) -> list[ShiftEntry]:
     entries: list[ShiftEntry] = []
     current_year_month: tuple[int, int] | None = None
@@ -500,6 +520,7 @@ def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, 
                     site_mode=definition.site_mode,
                     schedule_mode=definition.schedule_mode,
                     service_category=definition.service_category,
+                    note=shift_note_for_definition(definition),
                     source=definition.label,
                     admin_categories=definition.admin_categories,
                     display_order=order_counter,
@@ -512,12 +533,13 @@ def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, 
             admin_categories = ("evening", "overnight") if evening_interval else OVERNIGHT_SHIFT.admin_categories
             entries.append(
                 ShiftEntry(
-                    service_date=service_date,
+                    service_date=service_date + timedelta(days=1),
                     start_time=start_time,
                     end_time=OVERNIGHT_SHIFT.default_end,
                     site_mode=OVERNIGHT_SHIFT.site_mode,
                     schedule_mode=OVERNIGHT_SHIFT.schedule_mode,
                     service_category=OVERNIGHT_SHIFT.service_category,
+                    note=overnight_note(service_date, includes_evening=bool(evening_interval)),
                     source="Evening + Overnight" if evening_interval else "Overnight",
                     admin_categories=admin_categories,
                     display_order=order_counter,
@@ -533,6 +555,7 @@ def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, 
                     site_mode=EVENING_SHIFT.site_mode,
                     schedule_mode=EVENING_SHIFT.schedule_mode,
                     service_category=EVENING_SHIFT.service_category,
+                    note=shift_note_for_definition(EVENING_SHIFT),
                     source="Evening",
                     admin_categories=EVENING_SHIFT.admin_categories,
                     display_order=order_counter,
