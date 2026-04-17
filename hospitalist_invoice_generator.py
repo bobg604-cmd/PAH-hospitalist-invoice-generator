@@ -39,6 +39,8 @@ except ModuleNotFoundError as exc:
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
 SCRIPT_PATH = BASE_DIR / "hospitalist_invoice_generator.py"
+TEMPLATE_DIR = BASE_DIR / "templates"
+TEMPLATE_SETTINGS_FILE = TEMPLATE_DIR / ".active-template"
 BUNDLED_PYTHON = Path(
     r"C:\Users\bobg6\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 )
@@ -46,9 +48,7 @@ DEFAULT_MASTER_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1DlDnljstmxsqgJyKTU0eWdl4-YBRQvm3eaE7PENVVRE/edit?gid=61161592"
 )
-DEFAULT_TEMPLATE = Path(
-    BASE_DIR / "templates" / "FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx"
-)
+BUNDLED_TEMPLATE = TEMPLATE_DIR / "FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx"
 START_ROW = 18
 END_ROW = 217
 ADMIN_MINUTES = 15
@@ -212,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serve", action="store_true", help="Launch the local web form instead of running one-off CLI mode.")
     parser.add_argument("--host", default=default_host, help="Host for web mode.")
     parser.add_argument("--port", type=int, default=default_port, help="Port for web mode.")
-    parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE, help="Path to an existing invoice workbook.")
+    parser.add_argument("--template", type=Path, default=BUNDLED_TEMPLATE, help="Path to an existing invoice workbook.")
     parser.add_argument("--master-url", default=DEFAULT_MASTER_URL, help="Google Sheets share or export URL.")
     parser.add_argument("--physician-name", help="Physician legal name for the invoice header.")
     parser.add_argument("--first-name", help="First name for the invoice header.")
@@ -729,9 +729,15 @@ def default_output_path(
     month_name = date(year, month, 1).strftime("%b %Y")
     period_label = "1st half" if period == "first" else "2nd half"
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", physician_name).strip("_")
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return OUTPUT_DIR / f"{month_name} {period_label} - {safe_name} - {site} - {timestamp}.xlsx"
+    base_name = f"{month_name} {period_label} - {safe_name} - {site}"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    candidate = OUTPUT_DIR / f"{base_name} - {timestamp}.xlsx"
+    counter = 2
+    while candidate.exists():
+        candidate = OUTPUT_DIR / f"{base_name} - {timestamp}-{counter}.xlsx"
+        counter += 1
+    return candidate
 
 
 def recalculate_workbook_with_excel(workbook_path: Path) -> None:
@@ -771,6 +777,45 @@ def recalculate_workbook_with_excel(workbook_path: Path) -> None:
         )
     except (OSError, subprocess.SubprocessError):
         return
+
+
+def ensure_template_dir() -> None:
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def template_extensions() -> tuple[str, ...]:
+    return (".xlsx", ".xlsm", ".xltx", ".xltm")
+
+
+def list_available_templates() -> list[Path]:
+    ensure_template_dir()
+    templates = [path for path in TEMPLATE_DIR.iterdir() if path.is_file() and path.suffix.lower() in template_extensions()]
+    return sorted(templates, key=lambda path: path.name.lower())
+
+
+def get_active_template() -> Path:
+    ensure_template_dir()
+    if TEMPLATE_SETTINGS_FILE.exists():
+        selected_name = TEMPLATE_SETTINGS_FILE.read_text(encoding="utf-8").strip()
+        if selected_name:
+            candidate = TEMPLATE_DIR / selected_name
+            if candidate.exists():
+                return candidate
+    if BUNDLED_TEMPLATE.exists():
+        return BUNDLED_TEMPLATE
+    templates = list_available_templates()
+    if templates:
+        return templates[0]
+    return BUNDLED_TEMPLATE
+
+
+def set_active_template(template_name: str) -> Path:
+    ensure_template_dir()
+    target = TEMPLATE_DIR / Path(template_name).name
+    if not target.exists():
+        raise FileNotFoundError(f"Template not found: {target.name}")
+    TEMPLATE_SETTINGS_FILE.write_text(target.name, encoding="utf-8")
+    return target
 
 
 def print_generation_summary(result: GenerationResult) -> None:
@@ -876,7 +921,13 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
         options.site,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(options.template, output_path)
+    try:
+        shutil.copy2(options.template, output_path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Could not create the output workbook because Windows denied access to:\n{output_path}\n"
+            "If that workbook is already open in Excel, close it and try again."
+        ) from exc
 
     workbook = load_workbook(output_path)
     configure_invoice_header(
@@ -891,7 +942,13 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
     clear_invoice_rows(workbook["Invoice"])
     write_invoice_rows(workbook["Invoice"], result.invoice_rows)
     workbook.calculation = CalcProperties(calcMode="auto", fullCalcOnLoad=True, forceFullCalc=True)
-    workbook.save(output_path)
+    try:
+        workbook.save(output_path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Could not save the output workbook because Windows denied access to:\n{output_path}\n"
+            "If that workbook is already open in Excel, close it and try again."
+        ) from exc
     recalculate_workbook_with_excel(output_path)
     result.output_path = output_path
     return result
@@ -910,13 +967,21 @@ def render_form(
     values: dict[str, str] | None = None,
     errors: list[str] | None = None,
     result: GenerationResult | None = None,
+    active_tab: str = "invoice",
+    template_errors: list[str] | None = None,
+    template_message: str | None = None,
 ) -> str:
     values = values or {}
     errors = errors or []
+    template_errors = template_errors or []
+    active_tab = "templates" if active_tab == "templates" else "invoice"
     checked_admin = set(values.get("clinical_admin_types", "").split(",")) if values.get("clinical_admin_types") else set()
     selected_month = int(values["month"]) if values.get("month", "").isdigit() else date.today().month
     period_value = values.get("period", "first")
     current_year = date.today().year
+    available_templates = list_available_templates()
+    active_template = get_active_template()
+    active_template_name = active_template.name if active_template else "No template selected"
 
     def field(name: str, default: str = "") -> str:
         return html.escape(values.get(name, default))
@@ -924,10 +989,17 @@ def render_form(
     def checked(name: str) -> str:
         return " checked" if name in checked_admin else ""
 
-    error_html = ""
-    if errors:
-        items = "".join(f"<li>{html.escape(message)}</li>" for message in errors)
-        error_html = f'<div class="alert error"><strong>Please fix:</strong><ul>{items}</ul></div>'
+    def alert_html(messages: list[str], title: str = "Please fix:") -> str:
+        if not messages:
+            return ""
+        items = "".join(f"<li>{html.escape(message)}</li>" for message in messages)
+        return f'<div class="alert error"><strong>{html.escape(title)}</strong><ul>{items}</ul></div>'
+
+    error_html = alert_html(errors)
+    template_error_html = alert_html(template_errors)
+    template_success_html = (
+        f'<div class="alert success"><strong>{html.escape(template_message)}</strong></div>' if template_message else ""
+    )
 
     result_html = ""
     if result:
@@ -969,6 +1041,150 @@ def render_form(
             f"{skipped_html}"
             "</section>"
         )
+
+    template_cards = []
+    for template_path in available_templates:
+        template_name = template_path.name
+        download_url = f"/template-files/{quote(template_name)}"
+        badge = '<span class="badge">Bundled default</span>' if template_name == BUNDLED_TEMPLATE.name else ""
+        status = '<span class="active-pill">Active</span>' if template_path == active_template else ""
+        checked_attr = " checked" if template_path == active_template else ""
+        template_cards.append(
+            '<label class="template-option">'
+            f'<span class="template-option-main"><input type="radio" name="template_name" value="{html.escape(template_name)}"{checked_attr}>'
+            f'<span><strong>{html.escape(template_name)}</strong>{badge}{status}<span class="template-meta">Stored in the app and available to all users of this deployment.</span></span></span>'
+            f'<a href="{download_url}">Download</a>'
+            "</label>"
+        )
+    template_list_html = "".join(template_cards) or "<p>No templates are currently available. Upload one below to get started.</p>"
+
+    invoice_panel = f"""
+      <form class="panel" method="post" action="/generate" enctype="multipart/form-data">
+        {error_html}
+        <h2>Invoice Details</h2>
+        <div class="two">
+          <label>Physician Legal Name
+            <input name="physician_name" value="{field('physician_name')}" required>
+          </label>
+          <label>MSP #
+            <input name="msp" value="{field('msp')}" required>
+          </label>
+        </div>
+        <div class="two">
+          <label>First Name
+            <input name="first_name" value="{field('first_name')}" required>
+          </label>
+          <label>Last Name
+            <input name="last_name" value="{field('last_name')}" required>
+          </label>
+        </div>
+        <div class="two">
+          <label>Site / Facility
+            <input name="site" value="{field('site', 'PAH')}" required>
+          </label>
+          <label>Name on Master Schedule
+            <input name="schedule_name" value="{field('schedule_name')}" required>
+            <span class="hint">Match the spreadsheet exactly. Usually last name only, unless the schedule uses a more specific name like "Johal, S".</span>
+          </label>
+        </div>
+        <label>Extra Schedule Aliases
+          <textarea name="schedule_aliases" placeholder="Optional. Separate aliases with ;">{field('schedule_aliases')}</textarea>
+        </label>
+        <div class="section-title">Reporting Period</div>
+        <div class="two">
+          <label>Year
+            <input name="year" type="number" value="{field('year', str(current_year))}" required>
+          </label>
+          <label>Month
+            <select name="month">{month_options(selected_month)}</select>
+          </label>
+        </div>
+        <div class="two">
+          <label>Half of Month
+            <select name="period">
+              <option value="first"{' selected' if period_value == 'first' else ''}>1 to 15</option>
+              <option value="second"{' selected' if period_value == 'second' else ''}>16 to month end</option>
+            </select>
+          </label>
+          <label>Submission Date
+            <input name="submission_date" type="date" value="{field('submission_date', date.today().isoformat())}">
+          </label>
+        </div>
+        <div class="section-title">Clinical Admin</div>
+        <p class="hint">Checking a box adds one extra 15-minute clinical admin billing entry after each shift of that type. If the 15-minute add-on would overlap another billed interval, it is skipped automatically.</p>
+        <div class="checks">
+          <label class="check"><input type="checkbox" name="clinical_admin_type" value="scheduled"{checked('scheduled')}>Scheduled / Team</label>
+          <label class="check"><input type="checkbox" name="clinical_admin_type" value="evening"{checked('evening')}>Evening</label>
+          <label class="check"><input type="checkbox" name="clinical_admin_type" value="overnight"{checked('overnight')}>Overnight</label>
+          <label class="check"><input type="checkbox" name="clinical_admin_type" value="admit"{checked('admit')}>ADMIT</label>
+          <label class="check"><input type="checkbox" name="clinical_admin_type" value="virtual"{checked('virtual')}>VIRTUAL</label>
+        </div>
+        <label>Clinical Admin Note
+          <input name="clinical_admin_note" value="{field('clinical_admin_note', 'doing billings')}">
+        </label>
+        <div class="section-title">Sources</div>
+        <label>Master Schedule URL
+          <input name="master_url" value="{field('master_url', DEFAULT_MASTER_URL)}" required>
+        </label>
+        <p class="hint">Using active template: <strong>{html.escape(active_template_name)}</strong>. Change it in the Templates tab if needed.</p>
+        <div class="actions">
+          <button type="submit">Generate Workbook</button>
+          <button class="ghost" type="button" onclick="window.location='/'">Reset</button>
+        </div>
+      </form>
+    """
+
+    invoice_side_panel = result_html or (
+        '<section class="panel"><h2>How It Works</h2>'
+        "<p>The app reads the live Google Sheets schedule, matches your name or aliases for the selected half-month, fills the active invoice template, and saves the workbook into the local outputs folder.</p>"
+        "<p>Use aliases when the master sheet uses abbreviations or a slightly different spelling for your name.</p>"
+        "<p>This tool is intended for PAH hospitalists. Other sites may work, but they have not been tested yet.</p>"
+        "</section>"
+    )
+
+    templates_panel = f"""
+      <section class="panel">
+        {template_error_html}
+        {template_success_html}
+        <h2>Templates</h2>
+        <p class="hint">The active template is used automatically when anyone generates an invoice.</p>
+        <div class="template-current">
+          <span class="section-title">Current Active Template</span>
+          <strong>{html.escape(active_template_name)}</strong>
+          <span class="template-meta">Bundled default: {html.escape(BUNDLED_TEMPLATE.name)}</span>
+        </div>
+        <form method="post" action="/templates/select">
+          <div class="template-list">{template_list_html}</div>
+          <div class="actions">
+            <button type="submit">Use Selected Template</button>
+          </div>
+        </form>
+        <div class="section-title">Upload Another Template</div>
+        <form method="post" action="/templates/upload" enctype="multipart/form-data">
+          <label>Template Workbook
+            <input name="template_file" type="file" accept=".xlsx,.xlsm,.xltx,.xltm" required>
+          </label>
+          <p class="hint">Uploading here stores the workbook in the app and makes it available in the list above.</p>
+          <div class="actions">
+            <button type="submit">Upload and Use Template</button>
+          </div>
+        </form>
+      </section>
+    """
+
+    templates_side_panel = (
+        '<section class="panel"><h2>Template Notes</h2>'
+        "<p>The bundled PAH template stays available here as the default reference workbook.</p>"
+        "<p>You can switch back to it at any time, or upload a different workbook for the whole deployment to use.</p>"
+        "<p>This is intended for PAH hospitalists. Other sites may work, but they have not been tested yet.</p>"
+        "</section>"
+    )
+
+    main_content = (
+        f'<div class="grid">{invoice_panel}{invoice_side_panel}</div>'
+        if active_tab == "invoice"
+        else f'<div class="grid">{templates_panel}{templates_side_panel}</div>'
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -1017,6 +1233,32 @@ def render_form(
       max-width: 760px;
       color: var(--muted);
       font-size: 1rem;
+    }}
+    .tabs {{
+      display: inline-flex;
+      gap: 10px;
+      margin-top: 24px;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: rgba(255, 250, 240, 0.72);
+      box-shadow: var(--shadow);
+    }}
+    .tab-link {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 170px;
+      padding: 12px 16px;
+      border-radius: 999px;
+      color: var(--muted);
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    .tab-link.active {{
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 10px 24px rgba(15, 118, 110, 0.18);
     }}
     .grid {{
       display: grid;
@@ -1131,6 +1373,11 @@ def render_form(
       color: var(--accent);
       font-weight: 700;
     }}
+    .alert.success {{
+      border: 1px solid #add9ce;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }}
     .table-wrap {{
       overflow: auto;
       border: 1px solid var(--border);
@@ -1159,12 +1406,86 @@ def render_form(
       margin-top: -4px;
       margin-bottom: 10px;
     }}
+    .template-current {{
+      display: grid;
+      gap: 6px;
+      padding: 16px;
+      margin-bottom: 18px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: #fffdf8;
+    }}
+    .template-list {{
+      display: grid;
+      gap: 12px;
+    }}
+    .template-option {{
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: #fffdf8;
+      font-weight: 500;
+    }}
+    .template-option-main {{
+      display: flex;
+      gap: 12px;
+      align-items: start;
+    }}
+    .template-option input {{
+      width: auto;
+      margin: 2px 0 0;
+      transform: scale(1.15);
+    }}
+    .template-option a {{
+      color: var(--accent);
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .template-meta {{
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      font-weight: 400;
+    }}
+    .badge,
+    .active-pill {{
+      display: inline-flex;
+      align-items: center;
+      margin-left: 8px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 700;
+    }}
+    .badge {{
+      background: #efe4bb;
+      color: #705200;
+    }}
+    .active-pill {{
+      background: var(--accent-soft);
+      color: var(--accent);
+    }}
     @media (max-width: 900px) {{
       .grid {{
         grid-template-columns: 1fr;
       }}
       .checks, .two {{
         grid-template-columns: 1fr;
+      }}
+      .tabs {{
+        display: flex;
+      }}
+      .tab-link {{
+        min-width: 0;
+        flex: 1;
+      }}
+      .template-option {{
+        flex-direction: column;
       }}
     }}
   </style>
@@ -1173,84 +1494,13 @@ def render_form(
   <div class="shell">
     <div class="hero">
       <h1>Hospitalist Invoice Generator</h1>
-      <p>Fill in your billing details, choose which shift types should get a 15-minute clinical admin add-on, and generate the invoice workbook from the live master schedule.</p>
+      <p>Generate invoice workbooks from the live master schedule, then switch templates in one place when the standard workbook changes.</p>
     </div>
-    <div class="grid">
-      <form class="panel" method="post" action="/generate" enctype="multipart/form-data">
-        {error_html}
-        <h2>Invoice Details</h2>
-        <div class="two">
-          <label>Physician Legal Name
-            <input name="physician_name" value="{field('physician_name')}" required>
-          </label>
-          <label>MSP #
-            <input name="msp" value="{field('msp')}" required>
-          </label>
-        </div>
-        <div class="two">
-          <label>First Name
-            <input name="first_name" value="{field('first_name')}" required>
-          </label>
-          <label>Last Name
-            <input name="last_name" value="{field('last_name')}" required>
-          </label>
-        </div>
-        <div class="two">
-          <label>Site / Facility
-            <input name="site" value="{field('site', 'PAH')}" required>
-          </label>
-          <label>Name on Master Schedule
-            <input name="schedule_name" value="{field('schedule_name')}" required>
-            <span class="hint">Match the spreadsheet exactly. Usually last name only, unless the schedule uses a more specific name like "Johal, S".</span>
-          </label>
-        </div>
-        <label>Extra Schedule Aliases
-          <textarea name="schedule_aliases" placeholder="Optional. Separate aliases with ;">{field('schedule_aliases')}</textarea>
-        </label>
-        <div class="section-title">Reporting Period</div>
-        <div class="two">
-          <label>Year
-            <input name="year" type="number" value="{field('year', str(current_year))}" required>
-          </label>
-          <label>Month
-            <select name="month">{month_options(selected_month)}</select>
-          </label>
-        </div>
-        <div class="two">
-          <label>Half of Month
-            <select name="period">
-              <option value="first"{' selected' if period_value == 'first' else ''}>1 to 15</option>
-              <option value="second"{' selected' if period_value == 'second' else ''}>16 to month end</option>
-            </select>
-          </label>
-          <label>Submission Date
-            <input name="submission_date" type="date" value="{field('submission_date', date.today().isoformat())}">
-          </label>
-        </div>
-        <div class="section-title">Clinical Admin</div>
-        <p class="hint">Checking a box adds one extra 15-minute clinical admin billing entry after each shift of that type. If the 15-minute add-on would overlap another billed interval, it is skipped automatically.</p>
-        <div class="checks">
-          <label class="check"><input type="checkbox" name="clinical_admin_type" value="scheduled"{checked('scheduled')}>Scheduled / Team</label>
-          <label class="check"><input type="checkbox" name="clinical_admin_type" value="evening"{checked('evening')}>Evening</label>
-          <label class="check"><input type="checkbox" name="clinical_admin_type" value="overnight"{checked('overnight')}>Overnight</label>
-          <label class="check"><input type="checkbox" name="clinical_admin_type" value="admit"{checked('admit')}>ADMIT</label>
-          <label class="check"><input type="checkbox" name="clinical_admin_type" value="virtual"{checked('virtual')}>VIRTUAL</label>
-        </div>
-        <label>Clinical Admin Note
-          <input name="clinical_admin_note" value="{field('clinical_admin_note', 'doing billings')}">
-        </label>
-        <div class="section-title">Sources</div>
-        <label>Master Schedule URL
-          <input name="master_url" value="{field('master_url', DEFAULT_MASTER_URL)}" required>
-        </label>
-        <p class="hint">The standard PAH invoice template is included automatically.</p>
-        <div class="actions">
-          <button type="submit">Generate Workbook</button>
-          <button class="ghost" type="button" onclick="window.location='/'">Reset</button>
-        </div>
-      </form>
-      {result_html or '<section class="panel"><h2>How It Works</h2><p>The app reads the live Google Sheets schedule, matches your name or aliases for the selected half-month, fills the invoice template, and saves the workbook into the local outputs folder.</p><p>Use aliases when the master sheet uses abbreviations or a slightly different spelling for your name.</p><p>This tool is intended for PAH hospitalists. Other sites may work, but they have not been tested yet.</p></section>'}
+    <div class="tabs">
+      <a class="tab-link{' active' if active_tab == 'invoice' else ''}" href="/?tab=invoice">Generate Invoice</a>
+      <a class="tab-link{' active' if active_tab == 'templates' else ''}" href="/?tab=templates">Templates</a>
     </div>
+    {main_content}
   </div>
 </body>
 </html>"""
@@ -1300,7 +1550,7 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     if month < 1 or month > 12:
         raise ValueError("Month must be between 1 and 12.")
 
-    template_path = uploaded_template_path or DEFAULT_TEMPLATE
+    template_path = uploaded_template_path or get_active_template()
     if template_path is None:
         raise ValueError("Template workbook not found.")
     master_url = collect_form_value(data, "master_url", DEFAULT_MASTER_URL)
@@ -1346,7 +1596,7 @@ def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
     return values
 
 
-def save_uploaded_template(filename: str, content: bytes) -> Path | None:
+def save_uploaded_template(filename: str, content: bytes, destination_dir: Path | None = None) -> Path | None:
     filename = Path(filename).name
     if not filename:
         return None
@@ -1354,10 +1604,19 @@ def save_uploaded_template(filename: str, content: bytes) -> Path | None:
     if not content:
         return None
 
-    upload_dir = OUTPUT_DIR / "_uploads"
+    upload_dir = destination_dir or (OUTPUT_DIR / "_uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(filename).suffix or ".xlsx"
-    target = upload_dir / f"template-{uuid4().hex}{suffix}"
+    if destination_dir:
+        stem = Path(filename).stem
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "template"
+        target = upload_dir / f"{safe_stem}{suffix}"
+        counter = 2
+        while target.exists():
+            target = upload_dir / f"{safe_stem}-{counter}{suffix}"
+            counter += 1
+    else:
+        target = upload_dir / f"template-{uuid4().hex}{suffix}"
     target.write_bytes(content)
     return target
 
@@ -1398,7 +1657,11 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            self.respond_html(render_form())
+            requested_tab = parse_qs(parsed.query).get("tab", ["invoice"])[0]
+            self.respond_html(render_form(active_tab=requested_tab))
+            return
+        if parsed.path.startswith("/template-files/"):
+            self.serve_template_file(parsed.path.removeprefix("/template-files/"))
             return
         if parsed.path.startswith("/outputs/"):
             self.serve_output_file(parsed.path.removeprefix("/outputs/"))
@@ -1407,23 +1670,106 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/generate":
-            self.send_error(HTTPStatus.NOT_FOUND, "Page not found.")
+        if parsed.path == "/generate":
+            self.handle_generate()
             return
+        if parsed.path == "/templates/select":
+            self.handle_template_select()
+            return
+        if parsed.path == "/templates/upload":
+            self.handle_template_upload()
+            return
+        self.send_error(HTTPStatus.NOT_FOUND, "Page not found.")
 
+    def handle_generate(self) -> None:
         payload = parse_form_payload(self)
         values = form_values_from_request_data(payload.values)
 
         try:
             options = build_options_from_form(payload.values, payload.uploaded_template_path)
             result = generate_invoice(options)
-            self.respond_html(render_form(values=values, result=result))
+            self.respond_html(render_form(values=values, result=result, active_tab="invoice"))
         except Exception as exc:  # noqa: BLE001
             errors = str(exc).splitlines() or [str(exc)]
-            self.respond_html(render_form(values=values, errors=errors), status=HTTPStatus.BAD_REQUEST)
+            self.respond_html(
+                render_form(values=values, errors=errors, active_tab="invoice"),
+                status=HTTPStatus.BAD_REQUEST,
+            )
         finally:
             if payload.uploaded_template_path and payload.uploaded_template_path.exists():
                 payload.uploaded_template_path.unlink(missing_ok=True)
+
+    def handle_template_select(self) -> None:
+        payload = parse_form_payload(self)
+        template_name = collect_form_value(payload.values, "template_name")
+
+        try:
+            if not template_name:
+                raise ValueError("Please select a template first.")
+            active_template = set_active_template(template_name)
+            self.respond_html(
+                render_form(
+                    active_tab="templates",
+                    template_message=f"Active template changed to {active_template.name}.",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors = str(exc).splitlines() or [str(exc)]
+            self.respond_html(
+                render_form(active_tab="templates", template_errors=errors),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        finally:
+            if payload.uploaded_template_path and payload.uploaded_template_path.exists():
+                payload.uploaded_template_path.unlink(missing_ok=True)
+
+    def handle_template_upload(self) -> None:
+        payload = parse_form_payload(self)
+
+        try:
+            if payload.uploaded_template_path is None or not payload.uploaded_template_path.exists():
+                raise ValueError("Please choose a template workbook to upload.")
+            suffix = payload.uploaded_template_path.suffix.lower()
+            if suffix not in template_extensions():
+                raise ValueError("Template must be an Excel workbook (.xlsx, .xlsm, .xltx, or .xltm).")
+            uploaded_template = save_uploaded_template(
+                payload.uploaded_template_path.name,
+                payload.uploaded_template_path.read_bytes(),
+                destination_dir=TEMPLATE_DIR,
+            )
+            if uploaded_template is None:
+                raise ValueError("Template upload failed.")
+            set_active_template(uploaded_template.name)
+            self.respond_html(
+                render_form(
+                    active_tab="templates",
+                    template_message=f"Uploaded and activated {uploaded_template.name}.",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors = str(exc).splitlines() or [str(exc)]
+            self.respond_html(
+                render_form(active_tab="templates", template_errors=errors),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        finally:
+            if payload.uploaded_template_path and payload.uploaded_template_path.exists():
+                payload.uploaded_template_path.unlink(missing_ok=True)
+
+    def serve_template_file(self, file_name: str) -> None:
+        safe_name = Path(unquote(file_name)).name
+        target = (TEMPLATE_DIR / safe_name).resolve()
+        if TEMPLATE_DIR.resolve() not in target.parents or not target.exists():
+            self.send_error(HTTPStatus.NOT_FOUND, "Page not found.")
+            return
+
+        data = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+        self.end_headers()
+        self.wfile.write(data)
 
     def serve_output_file(self, file_name: str) -> None:
         safe_name = Path(unquote(file_name)).name

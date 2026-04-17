@@ -23,7 +23,6 @@ That is the main way this project is meant to be used.
 You need:
 
 - this project folder
-- your invoice template Excel file
 - access to the master Google Sheet
 - your physician billing details
 
@@ -41,6 +40,13 @@ The form will ask for:
 - whether to add 15 minutes of clinical admin after certain shift types
 
 You can also add schedule aliases if your name appears in more than one way on the schedule.
+
+The website also has a `Templates` tab where you can:
+
+- see which invoice template is currently active
+- download the bundled default PAH template
+- switch to another saved template
+- upload a new template and make it the active one
 
 Example:
 
@@ -157,7 +163,9 @@ They do not need Python installed on their computer.
    - `requirements.txt`
    - `Procfile`
 6. After deploy, open the Railway-generated public URL.
-7. Test the site by uploading a template workbook and generating an invoice.
+7. Test the site by generating an invoice.
+
+If you ever need to change the workbook used by the site, open the `Templates` tab in the app.
 
 ### Custom Domain
 
