@@ -1256,7 +1256,7 @@ def render_form(
           <button class="ghost" type="button" onclick="window.location='/'">Reset</button>
         </div>
       </form>
-      {result_html or '<section class="panel"><h2>How It Works</h2><p>The app reads the live Google Sheets schedule, matches your name or aliases for the selected half-month, fills the invoice template, and saves the workbook into the local outputs folder.</p><p>Use aliases when the master sheet uses abbreviations or a slightly different spelling for your name.</p><p>If you host this on Railway, upload the template workbook in the form instead of using a local file path.</p></section>'}
+      {result_html or '<section class="panel"><h2>How It Works</h2><p>The app reads the live Google Sheets schedule, matches your name or aliases for the selected half-month, fills the invoice template, and saves the workbook into the local outputs folder.</p><p>Use aliases when the master sheet uses abbreviations or a slightly different spelling for your name.</p><p>This tool is intended for PAH hospitalists. Other sites may work, but they have not been tested yet.</p></section>'}
     </div>
   </div>
 </body>
