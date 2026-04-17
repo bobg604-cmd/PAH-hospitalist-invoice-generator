@@ -7,16 +7,20 @@ import argparse
 import csv
 import html
 import io
+import os
 import re
 import shutil
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import urlopen
+from uuid import uuid4
 
 OPENPYXL_IMPORT_ERROR: ModuleNotFoundError | None = None
 
@@ -137,6 +141,12 @@ class GenerationResult:
     output_path: Path | None = None
 
 
+@dataclass
+class ParsedFormData:
+    values: dict[str, list[str]]
+    uploaded_template_path: Path | None = None
+
+
 TEAM_SHIFTS = [
     ShiftDefinition(
         i,
@@ -193,12 +203,14 @@ OVERNIGHT_SHIFT = ShiftDefinition(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    default_host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    default_port = int(os.environ.get("PORT", "8765"))
     parser = argparse.ArgumentParser(
         description="Generate a hospitalist invoice workbook from the Google Sheets master schedule."
     )
     parser.add_argument("--serve", action="store_true", help="Launch the local web form instead of running one-off CLI mode.")
-    parser.add_argument("--host", default="127.0.0.1", help="Host for web mode.")
-    parser.add_argument("--port", type=int, default=8765, help="Port for web mode.")
+    parser.add_argument("--host", default=default_host, help="Host for web mode.")
+    parser.add_argument("--port", type=int, default=default_port, help="Port for web mode.")
     parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE, help="Path to an existing invoice workbook.")
     parser.add_argument("--master-url", default=DEFAULT_MASTER_URL, help="Google Sheets share or export URL.")
     parser.add_argument("--physician-name", help="Physician legal name for the invoice header.")
@@ -655,8 +667,9 @@ def default_output_path(
     month_name = date(year, month, 1).strftime("%b %Y")
     period_label = "1st half" if period == "first" else "2nd half"
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", physician_name).strip("_")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return OUTPUT_DIR / f"{month_name} {period_label} - {safe_name} - {site}.xlsx"
+    return OUTPUT_DIR / f"{month_name} {period_label} - {safe_name} - {site} - {timestamp}.xlsx"
 
 
 def print_generation_summary(result: GenerationResult) -> None:
@@ -1061,7 +1074,7 @@ def render_form(
       <p>Fill in your billing details, choose which shift types should get a 15-minute clinical admin add-on, and generate the invoice workbook from the live master schedule.</p>
     </div>
     <div class="grid">
-      <form class="panel" method="post" action="/generate">
+      <form class="panel" method="post" action="/generate" enctype="multipart/form-data">
         {error_html}
         <h2>Invoice Details</h2>
         <div class="two">
@@ -1124,8 +1137,12 @@ def render_form(
           <input name="clinical_admin_note" value="{field('clinical_admin_note', 'doing billings')}">
         </label>
         <div class="section-title">Sources</div>
+        <label>Template Workbook Upload
+          <input name="template_file" type="file" accept=".xlsx,.xlsm,.xltx,.xltm">
+        </label>
+        <p class="hint">For Railway or any hosted website, upload the blank invoice template here. On your own computer, you can still use a local file path instead.</p>
         <label>Template Workbook Path
-          <input name="template" value="{field('template', str(DEFAULT_TEMPLATE))}" required>
+          <input name="template" value="{field('template', str(DEFAULT_TEMPLATE))}">
         </label>
         <label>Master Schedule URL
           <input name="master_url" value="{field('master_url', DEFAULT_MASTER_URL)}" required>
@@ -1135,7 +1152,7 @@ def render_form(
           <button class="ghost" type="button" onclick="window.location='/'">Reset</button>
         </div>
       </form>
-      {result_html or '<section class="panel"><h2>How It Works</h2><p>The app reads the live Google Sheets schedule, matches your name or aliases for the selected half-month, fills the invoice template, and saves the workbook into the local outputs folder.</p><p>Use aliases when the master sheet uses abbreviations or a slightly different spelling for your name.</p></section>'}
+      {result_html or '<section class="panel"><h2>How It Works</h2><p>The app reads the live Google Sheets schedule, matches your name or aliases for the selected half-month, fills the invoice template, and saves the workbook into the local outputs folder.</p><p>Use aliases when the master sheet uses abbreviations or a slightly different spelling for your name.</p><p>If you host this on Railway, upload the template workbook in the form instead of using a local file path.</p></section>'}
     </div>
   </div>
 </body>
@@ -1149,7 +1166,7 @@ def collect_form_value(data: dict[str, list[str]], key: str, default: str = "") 
     return values[0].strip()
 
 
-def build_options_from_form(data: dict[str, list[str]]) -> GenerationOptions:
+def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: Path | None = None) -> GenerationOptions:
     physician_name = collect_form_value(data, "physician_name")
     first_name = collect_form_value(data, "first_name")
     last_name = collect_form_value(data, "last_name")
@@ -1186,7 +1203,10 @@ def build_options_from_form(data: dict[str, list[str]]) -> GenerationOptions:
     if month < 1 or month > 12:
         raise ValueError("Month must be between 1 and 12.")
 
-    template_path = Path(collect_form_value(data, "template", str(DEFAULT_TEMPLATE)))
+    template_raw = collect_form_value(data, "template", str(DEFAULT_TEMPLATE))
+    template_path = uploaded_template_path or Path(template_raw) if template_raw else uploaded_template_path
+    if template_path is None:
+        raise ValueError("Please upload a template workbook or enter a local template path.")
     master_url = collect_form_value(data, "master_url", DEFAULT_MASTER_URL)
     submission_date = parse_submission_date(collect_form_value(data, "submission_date", date.today().isoformat()))
     clinical_admin_note = collect_form_value(data, "clinical_admin_note", "doing billings")
@@ -1231,6 +1251,52 @@ def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
     return values
 
 
+def save_uploaded_template(filename: str, content: bytes) -> Path | None:
+    filename = Path(filename).name
+    if not filename:
+        return None
+
+    if not content:
+        return None
+
+    upload_dir = OUTPUT_DIR / "_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(filename).suffix or ".xlsx"
+    target = upload_dir / f"template-{uuid4().hex}{suffix}"
+    target.write_bytes(content)
+    return target
+
+
+def parse_form_payload(handler: BaseHTTPRequestHandler) -> ParsedFormData:
+    content_type = handler.headers.get("Content-Type", "")
+    if content_type.startswith("multipart/form-data"):
+        content_length = int(handler.headers.get("Content-Length", "0"))
+        body = handler.rfile.read(content_length)
+        message = BytesParser(policy=policy.default).parsebytes(
+            b"Content-Type: " + content_type.encode("utf-8") + b"\r\n"
+            b"MIME-Version: 1.0\r\n\r\n" + body
+        )
+        values: dict[str, list[str]] = {}
+        uploaded_template_path: Path | None = None
+        for part in message.iter_parts():
+            key = part.get_param("name", header="content-disposition")
+            if not key:
+                continue
+            filename = part.get_filename()
+            content = part.get_payload(decode=True) or b""
+            if filename:
+                if key == "template_file" and uploaded_template_path is None:
+                    uploaded_template_path = save_uploaded_template(filename, content)
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            values.setdefault(key, []).append(content.decode(charset))
+        return ParsedFormData(values=values, uploaded_template_path=uploaded_template_path)
+
+    content_length = int(handler.headers.get("Content-Length", "0"))
+    body = handler.rfile.read(content_length).decode("utf-8")
+    return ParsedFormData(values=parse_qs(body, keep_blank_values=True))
+
+
 class InvoiceRequestHandler(BaseHTTPRequestHandler):
     server_version = "HospitalistInvoiceHTTP/1.0"
 
@@ -1250,18 +1316,19 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "Page not found.")
             return
 
-        content_length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(content_length).decode("utf-8")
-        data = parse_qs(body, keep_blank_values=True)
-        values = form_values_from_request_data(data)
+        payload = parse_form_payload(self)
+        values = form_values_from_request_data(payload.values)
 
         try:
-            options = build_options_from_form(data)
+            options = build_options_from_form(payload.values, payload.uploaded_template_path)
             result = generate_invoice(options)
             self.respond_html(render_form(values=values, result=result))
         except Exception as exc:  # noqa: BLE001
             errors = str(exc).splitlines() or [str(exc)]
             self.respond_html(render_form(values=values, errors=errors), status=HTTPStatus.BAD_REQUEST)
+        finally:
+            if payload.uploaded_template_path and payload.uploaded_template_path.exists():
+                payload.uploaded_template_path.unlink(missing_ok=True)
 
     def serve_output_file(self, file_name: str) -> None:
         safe_name = Path(unquote(file_name)).name

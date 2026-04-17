@@ -1,77 +1,122 @@
 # PAH Hospitalist Invoice Generator
 
-Generate Fraser Health hospitalist invoice workbooks from the master Google Sheets schedule.
+This tool creates a hospitalist invoice workbook from the master schedule.
 
-The app reads the live schedule, matches a physician's shifts for a selected half-month, fills an invoice template workbook, and saves the result into a local `outputs/` folder.
+You do not need to know Python to use the normal version of this app.
 
-## What It Does
+## The Easy Way
 
-- Matches shifts by schedule name plus optional aliases
-- Generates invoices for the first half or second half of a month
-- Supports daytime team shifts, ADMIT, VIRTUAL, evening, and overnight work
-- Optionally adds a 15-minute clinical admin row after selected shift types
-- Avoids adding clinical admin if that extra time overlaps another billed interval
-- Saves finished workbooks into `outputs/`
+For most people, using this app should look like this:
 
-## Shift Rules
+1. Open this folder on your computer.
+2. Double-click `Start Hospitalist Invoice App.bat`.
+3. A black window will open.
+4. Open `http://127.0.0.1:8765` in your web browser.
+5. Fill in the form.
+6. Click the button to generate the invoice.
+7. Download the finished Excel file from the page.
 
-- Team/day shifts default to `07:00-17:00`
-- If a day-shift name has `*C` after it, such as `Grewal*C`, that shift is treated as on-call daytime coverage and billed as `06:30-17:30`
+That is the main way this project is meant to be used.
+
+## What You Need Before You Start
+
+You need:
+
+- this project folder
+- your invoice template Excel file
+- access to the master Google Sheet
+- your physician billing details
+
+## What the App Asks You For
+
+The form will ask for:
+
+- physician name
+- first name
+- last name
+- MSP number
+- site, such as `PAH`
+- the name used on the master schedule
+- the month and half of the month
+- whether to add 15 minutes of clinical admin after certain shift types
+
+You can also add schedule aliases if your name appears in more than one way on the schedule.
+
+Example:
+
+- `Smith`
+- `Smith, J`
+- `J Smith`
+
+## Where the Finished File Goes
+
+The app saves the finished invoice into the `outputs` folder inside this project.
+
+That folder is ignored by Git, so generated invoices are not pushed to GitHub in normal use.
+
+If you host the app online, generated files are still created on the server, but they are meant to be downloaded right away rather than stored permanently.
+
+## Special Shift Rules
+
+The app uses these rules:
+
+- regular day/team shifts are `07:00-17:00`
+- if a day-shift entry has `*C` after the name, such as `Grewal*C`, that day is billed as `06:30-17:30`
 - `VIRTUAL` shifts are billed as `17:00-21:00` and are `Off-Site`
-- Clinical admin is `Off-Site` only when it follows a `VIRTUAL` shift
-- Clinical admin is `On-Site` for the other supported shift types
+- clinical admin is `Off-Site` only when it follows a `VIRTUAL` shift
+- clinical admin is `On-Site` for the other supported shift types
 
-## Requirements
+## If Double-Clicking Works
 
-- Windows
-- Python 3.12+ recommended
-- `openpyxl`
-- Access to the master Google Sheet
-- An existing invoice template workbook
+If the app starts and the browser page opens, you do not need to worry about Python or installing anything else.
 
-If you do not already have `openpyxl` installed:
+## If Double-Clicking Does Not Work
+
+If the `.bat` file does not start the app, there are usually 2 possible reasons:
+
+1. The bundled Python runtime is missing on that computer.
+2. A required Python package is missing.
+
+If that happens, ask whoever is setting up the computer to help with the install, or use the steps below.
+
+## Simple Repair Steps
+
+If Python is already installed on the computer, open PowerShell in this folder and run:
 
 ```powershell
 python -m pip install openpyxl
+python .\hospitalist_invoice_generator.py --serve
 ```
 
-## Quick Start
-
-### Option 1: Launch the local web app
-
-Double-click:
-
-```text
-Start Hospitalist Invoice App.bat
-```
-
-If the bundled Python runtime is available, the app starts a local web server and tells you to open:
+Then open:
 
 ```text
 http://127.0.0.1:8765
 ```
 
-Then:
+## If Python Is Not Installed
 
-1. Fill in physician and billing details.
-2. Confirm or change the template workbook path.
-3. Confirm or change the Google Sheets master URL.
-4. Add schedule aliases if the schedule uses abbreviations or alternate spellings.
-5. Choose the month and half-month period.
-6. Select which shift types should get a 15-minute clinical admin add-on.
-7. Generate the workbook.
+If the computer does not have Python at all, the easiest fix is:
 
-The finished file is saved in `outputs/` and can be downloaded from the local app page.
-
-### Option 2: Run from the command line
-
-Start the web server directly:
+1. Install Python from the official Python website.
+2. During install, make sure Python is added to PATH if that option appears.
+3. Open PowerShell in this folder.
+4. Run:
 
 ```powershell
+python -m pip install openpyxl
 python .\hospitalist_invoice_generator.py --serve
 ```
 
-Or run a one-off invoice generation from the terminal:
+If the person using this tool is not comfortable doing that, it is completely reasonable to have someone else do the one-time setup.
+
+## Advanced Use
+
+Most users can ignore this section.
+
+You can also run the generator from the command line instead of the web form.
+
+Example:
 
 ```powershell
 python .\hospitalist_invoice_generator.py `
@@ -88,26 +133,54 @@ python .\hospitalist_invoice_generator.py `
   --clinical-admin-type virtual
 ```
 
-Useful optional flags:
+## Hosting On Railway
 
-- `--schedule-alias "Smith, J.;J Smith"` for alternate schedule names
-- `--clinical-admin-note "doing billings"` to change the clinical admin note
-- `--template "C:\path\to\template.xlsx"` to choose a workbook template
-- `--master-url "https://docs.google.com/..."` to override the source sheet
-- `--output "C:\path\to\invoice.xlsx"` to control the output path
-- `--dry-run` to print matched rows without writing a workbook
+This project can be hosted on Railway so users can open a website instead of installing anything locally.
 
-## Template Path
+### What Changes For Website Users
 
-The script currently has a default template path that points to a local file on the original development machine. If that file does not exist on your computer, update the template path in the web form or pass `--template` on the command line.
+On Railway:
 
-## Privacy
+- users open a website instead of double-clicking the `.bat` file
+- users should upload the blank invoice template in the form
+- users then download the finished workbook from the results page
 
-Generated invoices in `outputs/` may contain physician-identifying information. This folder is intentionally excluded from Git with `.gitignore`, so those files are not pushed to GitHub unless someone manually overrides that behavior.
+They do not need Python installed on their computer.
 
-## Project Files
+### Railway Setup
 
-- `hospitalist_invoice_generator.py`: main application
-- `Start Hospitalist Invoice App.bat`: Windows launcher for local web mode
-- `outputs/`: generated invoice workbooks
+1. Push this project to GitHub.
+2. Create a new Railway project.
+3. Choose `Deploy from GitHub repo`.
+4. Select this repository.
+5. Railway should detect the Python app automatically because this repo includes:
+   - `requirements.txt`
+   - `Procfile`
+6. After deploy, open the Railway-generated public URL.
+7. Test the site by uploading a template workbook and generating an invoice.
 
+### Custom Domain
+
+After the Railway app is working, you can add your own domain inside Railway.
+
+Typical setup:
+
+1. Buy a domain from a registrar such as Cloudflare Registrar or Namecheap.
+2. In Railway, open your service settings and add a custom domain.
+3. Copy the DNS record Railway gives you.
+4. Add that DNS record at your domain registrar.
+5. Wait for the domain to verify.
+
+### Notes For Hosting
+
+- Railway storage is not permanent, so users should download files right away.
+- The template workbook should be uploaded in the form instead of using a local Windows file path.
+- If you want login protection later, that can be added as a separate improvement.
+
+## Files In This Project
+
+- `hospitalist_invoice_generator.py`: the main app
+- `Start Hospitalist Invoice App.bat`: the easiest way to launch it
+- `requirements.txt`: Python dependencies for deployment
+- `Procfile`: tells Railway how to start the web app
+- `outputs`: where finished invoice files are saved
