@@ -10,6 +10,7 @@ import io
 import os
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from email import policy
@@ -695,6 +696,45 @@ def default_output_path(
     return OUTPUT_DIR / f"{month_name} {period_label} - {safe_name} - {site} - {timestamp}.xlsx"
 
 
+def recalculate_workbook_with_excel(workbook_path: Path) -> None:
+    if os.name != "nt":
+        return
+
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        return
+
+    escaped_path = str(workbook_path).replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"$path='{escaped_path}';"
+        "$wb=$null;$excel=$null;"
+        "try {"
+        "  $excel = New-Object -ComObject Excel.Application;"
+        "  $excel.Visible = $false;"
+        "  $excel.DisplayAlerts = $false;"
+        "  $wb = $excel.Workbooks.Open($path);"
+        "  $excel.CalculateFullRebuild();"
+        "  Start-Sleep -Milliseconds 750;"
+        "  $wb.Save();"
+        "  $wb.Close($true);"
+        "} finally {"
+        "  if ($wb -ne $null) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) | Out-Null }"
+        "  if ($excel -ne $null) { $excel.Quit(); [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null }"
+        "}"
+    )
+    try:
+        subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+
+
 def print_generation_summary(result: GenerationResult) -> None:
     print(f"Matched {len(result.invoice_rows)} invoice rows.")
     for entry in result.invoice_rows:
@@ -814,6 +854,7 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
     write_invoice_rows(workbook["Invoice"], result.invoice_rows)
     workbook.calculation = CalcProperties(calcMode="auto", fullCalcOnLoad=True, forceFullCalc=True)
     workbook.save(output_path)
+    recalculate_workbook_with_excel(output_path)
     result.output_path = output_path
     return result
 
@@ -1122,6 +1163,7 @@ def render_form(
           </label>
           <label>Name on Master Schedule
             <input name="schedule_name" value="{field('schedule_name')}" required>
+            <span class="hint">Usually last name.</span>
           </label>
         </div>
         <label>Extra Schedule Aliases
