@@ -143,7 +143,6 @@ On Railway:
 
 - users open a website instead of double-clicking the `.bat` file
 - the bundled invoice template is used automatically
-- users can still upload a template in the form if they want to override the default
 - users then download the finished workbook from the results page
 
 They do not need Python installed on their computer.
@@ -176,7 +175,6 @@ Typical setup:
 
 - Railway storage is not permanent, so users should download files right away.
 - The app includes a bundled default template for normal use.
-- The upload field can be used to temporarily override the bundled template.
 - If you want login protection later, that can be added as a separate improvement.
 
 ## Files In This Project

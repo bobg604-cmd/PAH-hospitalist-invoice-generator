@@ -1240,17 +1240,10 @@ def render_form(
           <input name="clinical_admin_note" value="{field('clinical_admin_note', 'doing billings')}">
         </label>
         <div class="section-title">Sources</div>
-        <label>Template Workbook Upload
-          <input name="template_file" type="file" accept=".xlsx,.xlsm,.xltx,.xltm">
-        </label>
-        <p class="hint">A bundled template is used automatically. Upload a file here only if you want to override it for this one run.</p>
-        <label>Template Workbook Path
-          <input name="template" value="{field('template', str(DEFAULT_TEMPLATE))}">
-        </label>
         <label>Master Schedule URL
           <input name="master_url" value="{field('master_url', DEFAULT_MASTER_URL)}" required>
         </label>
-        <p class="hint">Leave the template path as-is unless you want to point to a different workbook on your own computer.</p>
+        <p class="hint">The standard PAH invoice template is included automatically.</p>
         <div class="actions">
           <button type="submit">Generate Workbook</button>
           <button class="ghost" type="button" onclick="window.location='/'">Reset</button>
@@ -1307,12 +1300,9 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     if month < 1 or month > 12:
         raise ValueError("Month must be between 1 and 12.")
 
-    template_raw = collect_form_value(data, "template", str(DEFAULT_TEMPLATE))
-    template_path = uploaded_template_path or (Path(template_raw) if template_raw else None)
-    if template_path is None and DEFAULT_TEMPLATE.exists():
-        template_path = DEFAULT_TEMPLATE
+    template_path = uploaded_template_path or DEFAULT_TEMPLATE
     if template_path is None:
-        raise ValueError("Please upload a template workbook or enter a local template path.")
+        raise ValueError("Template workbook not found.")
     master_url = collect_form_value(data, "master_url", DEFAULT_MASTER_URL)
     submission_date = parse_submission_date(collect_form_value(data, "submission_date", date.today().isoformat()))
     clinical_admin_note = collect_form_value(data, "clinical_admin_note", "doing billings")
@@ -1350,7 +1340,6 @@ def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
         "period": collect_form_value(data, "period", "first"),
         "submission_date": collect_form_value(data, "submission_date", date.today().isoformat()),
         "clinical_admin_note": collect_form_value(data, "clinical_admin_note", "doing billings"),
-        "template": collect_form_value(data, "template", str(DEFAULT_TEMPLATE)),
         "master_url": collect_form_value(data, "master_url", DEFAULT_MASTER_URL),
         "clinical_admin_types": ",".join(data.get("clinical_admin_type", [])),
     }
