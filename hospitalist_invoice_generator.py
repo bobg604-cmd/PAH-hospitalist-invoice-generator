@@ -590,25 +590,7 @@ def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, 
             )
             order_counter += 1
 
-        if overnight_match:
-            start_time = evening_interval[0] if evening_interval else OVERNIGHT_SHIFT.default_start
-            admin_categories = ("evening", "overnight") if evening_interval else OVERNIGHT_SHIFT.admin_categories
-            entries.append(
-                ShiftEntry(
-                    service_date=service_date + timedelta(days=1),
-                    start_time=start_time,
-                    end_time=OVERNIGHT_SHIFT.default_end,
-                    site_mode=OVERNIGHT_SHIFT.site_mode,
-                    schedule_mode=OVERNIGHT_SHIFT.schedule_mode,
-                    service_category=OVERNIGHT_SHIFT.service_category,
-                    note=overnight_note(service_date, includes_evening=bool(evening_interval)),
-                    source="Evening + Overnight" if evening_interval else "Overnight",
-                    admin_categories=admin_categories,
-                    display_order=order_counter,
-                )
-            )
-            order_counter += 1
-        elif evening_interval:
+        if evening_interval:
             entries.append(
                 ShiftEntry(
                     service_date=service_date,
@@ -620,6 +602,23 @@ def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, 
                     note=shift_note_for_definition(EVENING_SHIFT),
                     source="Evening",
                     admin_categories=EVENING_SHIFT.admin_categories,
+                    display_order=order_counter,
+                )
+            )
+            order_counter += 1
+
+        if overnight_match:
+            entries.append(
+                ShiftEntry(
+                    service_date=service_date + timedelta(days=1),
+                    start_time=OVERNIGHT_SHIFT.default_start,
+                    end_time=OVERNIGHT_SHIFT.default_end,
+                    site_mode=OVERNIGHT_SHIFT.site_mode,
+                    schedule_mode=OVERNIGHT_SHIFT.schedule_mode,
+                    service_category=OVERNIGHT_SHIFT.service_category,
+                    note=overnight_note(service_date),
+                    source="Overnight",
+                    admin_categories=OVERNIGHT_SHIFT.admin_categories,
                     display_order=order_counter,
                 )
             )
