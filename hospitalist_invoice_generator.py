@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from email import policy
@@ -905,6 +906,21 @@ def format_usage_timestamp(raw_value: object) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M")
 
 
+def retry_on_permission_error(operation, *, attempts: int = 6, delay_seconds: float = 0.4):
+    last_error: PermissionError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except PermissionError as exc:
+            last_error = exc
+            if attempt == attempts:
+                raise
+            time_module.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Retry loop exited unexpectedly.")
+
+
 def print_generation_summary(result: GenerationResult) -> None:
     print(f"Matched {len(result.invoice_rows)} invoice rows.")
     for entry in result.invoice_rows:
@@ -1009,14 +1025,22 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.copy2(options.template, output_path)
+        retry_on_permission_error(lambda: shutil.copy2(options.template, output_path))
     except PermissionError as exc:
         raise PermissionError(
             f"Could not create the output workbook because Windows denied access to:\n{output_path}\n"
+            "This is usually caused by Excel, OneDrive, or Windows temporarily locking the file. "
             "If that workbook is already open in Excel, close it and try again."
         ) from exc
 
-    workbook = load_workbook(output_path)
+    try:
+        workbook = retry_on_permission_error(lambda: load_workbook(output_path))
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Could not open the new output workbook because Windows denied access to:\n{output_path}\n"
+            "This is usually caused by Excel, OneDrive, or Windows temporarily locking the file. "
+            "Please try again."
+        ) from exc
     configure_invoice_header(
         workbook=workbook,
         physician_name=options.physician_name,
@@ -1030,10 +1054,11 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
     write_invoice_rows(workbook["Invoice"], result.invoice_rows)
     workbook.calculation = CalcProperties(calcMode="auto", fullCalcOnLoad=True, forceFullCalc=True)
     try:
-        workbook.save(output_path)
+        retry_on_permission_error(lambda: workbook.save(output_path))
     except PermissionError as exc:
         raise PermissionError(
             f"Could not save the output workbook because Windows denied access to:\n{output_path}\n"
+            "This is usually caused by Excel, OneDrive, or Windows temporarily locking the file. "
             "If that workbook is already open in Excel, close it and try again."
         ) from exc
     recalculate_workbook_with_excel(output_path)
@@ -1222,6 +1247,7 @@ def render_form(
     invoice_side_panel = result_html or (
         '<section class="panel"><h2>How It Works</h2>'
         "<p>The app reads the live Google Sheets schedule, matches your name or aliases for the selected half-month, fills the active invoice template, and saves the workbook into the local outputs folder.</p>"
+        "<p><strong>You must enable editing and exit Protected View for the spreadsheet to work properly.</strong></p>"
         "<p>Use aliases when the master sheet uses abbreviations or a slightly different spelling for your name.</p>"
         "<p>This tool is intended for PAH hospitalists. Other sites may work, but they have not been tested yet.</p>"
         "</section>"
