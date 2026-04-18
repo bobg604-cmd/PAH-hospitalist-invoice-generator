@@ -398,6 +398,13 @@ def derive_default_aliases(first_name: str, last_name: str, physician_name: str,
     return aliases
 
 
+def filter_aliases_for_schedule_name(schedule_name: str, aliases: list[str]) -> list[str]:
+    schedule_name = schedule_name.strip()
+    if not schedule_name_is_specific(schedule_name):
+        return aliases
+    return [alias for alias in aliases if schedule_name_is_specific(alias)]
+
+
 def parse_admin_type_values(values: Iterable[str]) -> set[str]:
     result: set[str] = set()
     for raw in values:
@@ -949,7 +956,7 @@ def build_generation_options_from_args(args: argparse.Namespace) -> GenerationOp
     period = prompt_if_missing_choice(args.period, "Period", ["first", "second"], "first")
     schedule_name = prompt_if_missing(args.schedule_name, "Name as shown on master schedule", last_name)
 
-    aliases = split_aliases(args.schedule_alias)
+    aliases = filter_aliases_for_schedule_name(schedule_name, split_aliases(args.schedule_alias))
     clinical_admin_types = prompt_for_admin_types(args.clinical_admin_type)
 
     return GenerationOptions(
@@ -1639,7 +1646,10 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     msp = collect_form_value(data, "msp")
     site = collect_form_value(data, "site", "PAH").upper()
     schedule_name = collect_form_value(data, "schedule_name")
-    aliases = split_aliases([collect_form_value(data, "schedule_aliases")])
+    aliases = filter_aliases_for_schedule_name(
+        schedule_name,
+        split_aliases([collect_form_value(data, "schedule_aliases")]),
+    )
     year_raw = collect_form_value(data, "year", str(date.today().year))
     month_raw = collect_form_value(data, "month", str(date.today().month))
     period = collect_form_value(data, "period", "first")
