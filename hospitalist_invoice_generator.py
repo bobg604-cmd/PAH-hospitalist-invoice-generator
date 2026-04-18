@@ -7,10 +7,12 @@ import argparse
 import csv
 import html
 import io
+import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from email import policy
@@ -41,6 +43,9 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 SCRIPT_PATH = BASE_DIR / "hospitalist_invoice_generator.py"
 TEMPLATE_DIR = BASE_DIR / "templates"
 TEMPLATE_SETTINGS_FILE = TEMPLATE_DIR / ".active-template"
+DATA_DIR = BASE_DIR / "data"
+USAGE_METRICS_FILE = DATA_DIR / "usage_metrics.json"
+USAGE_METRICS_LOCK = threading.Lock()
 BUNDLED_PYTHON = Path(
     r"C:\Users\bobg6\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 )
@@ -61,6 +66,16 @@ ADMIN_TYPE_LABELS = {
     "admit": "ADMIT shifts",
     "virtual": "VIRTUAL shifts",
 }
+USAGE_COUNTER_KEYS = (
+    "page_views",
+    "invoice_attempts",
+    "invoice_successes",
+    "invoice_failures",
+    "invoice_downloads",
+    "template_selects",
+    "template_uploads",
+    "template_downloads",
+)
 
 
 def ensure_openpyxl_available() -> None:
@@ -818,6 +833,78 @@ def set_active_template(template_name: str) -> Path:
     return target
 
 
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def default_usage_metrics() -> dict[str, object]:
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "first_started_at": now,
+        "last_updated_at": now,
+        "counts": {key: 0 for key in USAGE_COUNTER_KEYS},
+    }
+
+
+def load_usage_metrics_unlocked() -> dict[str, object]:
+    ensure_data_dir()
+    metrics = default_usage_metrics()
+    if USAGE_METRICS_FILE.exists():
+        try:
+            loaded = json.loads(USAGE_METRICS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            if isinstance(loaded.get("first_started_at"), str):
+                metrics["first_started_at"] = loaded["first_started_at"]
+            if isinstance(loaded.get("last_updated_at"), str):
+                metrics["last_updated_at"] = loaded["last_updated_at"]
+            loaded_counts = loaded.get("counts", {})
+            if isinstance(loaded_counts, dict):
+                metrics["counts"].update(
+                    {
+                        key: int(loaded_counts.get(key, 0))
+                        for key in USAGE_COUNTER_KEYS
+                    }
+                )
+    return metrics
+
+
+def save_usage_metrics_unlocked(metrics: dict[str, object]) -> None:
+    ensure_data_dir()
+    payload = json.dumps(metrics, indent=2, sort_keys=True)
+    temp_path = USAGE_METRICS_FILE.with_suffix(".tmp")
+    temp_path.write_text(payload, encoding="utf-8")
+    temp_path.replace(USAGE_METRICS_FILE)
+
+
+def read_usage_metrics() -> dict[str, object]:
+    with USAGE_METRICS_LOCK:
+        return load_usage_metrics_unlocked()
+
+
+def record_usage_event(event_name: str) -> dict[str, object]:
+    if event_name not in USAGE_COUNTER_KEYS:
+        raise ValueError(f"Unsupported usage event: {event_name}")
+    with USAGE_METRICS_LOCK:
+        metrics = load_usage_metrics_unlocked()
+        counts = metrics["counts"]
+        counts[event_name] = int(counts.get(event_name, 0)) + 1
+        metrics["last_updated_at"] = datetime.now().isoformat(timespec="seconds")
+        save_usage_metrics_unlocked(metrics)
+        return metrics
+
+
+def format_usage_timestamp(raw_value: object) -> str:
+    if not isinstance(raw_value, str) or not raw_value:
+        return "Not yet"
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return str(raw_value)
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
 def print_generation_summary(result: GenerationResult) -> None:
     print(f"Matched {len(result.invoice_rows)} invoice rows.")
     for entry in result.invoice_rows:
@@ -982,7 +1069,6 @@ def render_form(
     available_templates = list_available_templates()
     active_template = get_active_template()
     active_template_name = active_template.name if active_template else "No template selected"
-
     def field(name: str, default: str = "") -> str:
         return html.escape(values.get(name, default))
 
@@ -1057,7 +1143,6 @@ def render_form(
             "</label>"
         )
     template_list_html = "".join(template_cards) or "<p>No templates are currently available. Upload one below to get started.</p>"
-
     invoice_panel = f"""
       <form class="panel" method="post" action="/generate" enctype="multipart/form-data">
         {error_html}
@@ -1665,6 +1750,7 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
+            record_usage_event("page_views")
             requested_tab = parse_qs(parsed.query).get("tab", ["invoice"])[0]
             self.respond_html(render_form(active_tab=requested_tab))
             return
@@ -1692,12 +1778,15 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
     def handle_generate(self) -> None:
         payload = parse_form_payload(self)
         values = form_values_from_request_data(payload.values)
+        record_usage_event("invoice_attempts")
 
         try:
             options = build_options_from_form(payload.values, payload.uploaded_template_path)
             result = generate_invoice(options)
+            record_usage_event("invoice_successes")
             self.respond_html(render_form(values=values, result=result, active_tab="invoice"))
         except Exception as exc:  # noqa: BLE001
+            record_usage_event("invoice_failures")
             errors = str(exc).splitlines() or [str(exc)]
             self.respond_html(
                 render_form(values=values, errors=errors, active_tab="invoice"),
@@ -1715,6 +1804,7 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
             if not template_name:
                 raise ValueError("Please select a template first.")
             active_template = set_active_template(template_name)
+            record_usage_event("template_selects")
             self.respond_html(
                 render_form(
                     active_tab="templates",
@@ -1748,6 +1838,7 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
             if uploaded_template is None:
                 raise ValueError("Template upload failed.")
             set_active_template(uploaded_template.name)
+            record_usage_event("template_uploads")
             self.respond_html(
                 render_form(
                     active_tab="templates",
@@ -1771,6 +1862,7 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "Page not found.")
             return
 
+        record_usage_event("template_downloads")
         data = target.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1786,6 +1878,7 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "File not found.")
             return
 
+        record_usage_event("invoice_downloads")
         data = target.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

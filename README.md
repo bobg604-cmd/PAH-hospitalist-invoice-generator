@@ -183,6 +183,7 @@ Typical setup:
 
 - Railway storage is not permanent, so users should download files right away.
 - The app includes a bundled default template for normal use.
+- The app can track anonymous aggregate counts such as visits and invoice generations without storing physician names, MSP numbers, or schedule details.
 - If you want login protection later, that can be added as a separate improvement.
 
 ## Files In This Project
