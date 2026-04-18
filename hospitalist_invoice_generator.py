@@ -1267,6 +1267,13 @@ def render_form(
       align-items: start;
       margin-top: 24px;
     }}
+    .footer-note {{
+      margin-top: 26px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.86rem;
+      letter-spacing: 0.02em;
+    }}
     .panel {{
       background: rgba(255, 250, 240, 0.94);
       border: 1px solid var(--border);
@@ -1501,6 +1508,7 @@ def render_form(
       <a class="tab-link{' active' if active_tab == 'templates' else ''}" href="/?tab=templates">Templates</a>
     </div>
     {main_content}
+    <div class="footer-note">Created by Dr Bobby Gu MD with Codex</div>
   </div>
 </body>
 </html>"""
