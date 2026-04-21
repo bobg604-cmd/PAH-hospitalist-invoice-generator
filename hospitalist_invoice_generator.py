@@ -47,6 +47,8 @@ TEMPLATE_SETTINGS_FILE = TEMPLATE_DIR / ".active-template"
 DATA_DIR = BASE_DIR / "data"
 USAGE_METRICS_FILE = DATA_DIR / "usage_metrics.json"
 USAGE_METRICS_LOCK = threading.Lock()
+SHIFT_HOURS_FILE = DATA_DIR / "shift_hours.json"
+SHIFT_HOURS_LOCK = threading.Lock()
 BUNDLED_PYTHON = Path(
     r"C:\Users\bobg6\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 )
@@ -60,6 +62,22 @@ END_ROW = 217
 ADMIN_MINUTES = 15
 ON_CALL_DAY_SHIFT_START = time(6, 30)
 ON_CALL_DAY_SHIFT_END = time(17, 30)
+DEFAULT_SHIFT_HOURS: dict[str, tuple[time, time]] = {
+    "day": (time(7, 0), time(17, 0)),
+    "day_call": (time(6, 30), time(17, 30)),
+    "evening": (time(17, 0), time(0, 0)),
+    "overnight": (time(0, 0), time(7, 0)),
+    "admit": (time(12, 0), time(18, 0)),
+    "virtual": (time(18, 0), time(21, 0)),
+}
+SHIFT_HOURS_LABELS: dict[str, str] = {
+    "day": "Day shift",
+    "day_call": "Day shift on-call (*C)",
+    "evening": "Evening shift",
+    "overnight": "Overnight shift",
+    "admit": "ADMIT shift",
+    "virtual": "VIRTUAL shift",
+}
 ADMIN_TYPE_LABELS = {
     "scheduled": "Scheduled daytime/team shifts",
     "evening": "Evening shifts",
@@ -181,7 +199,7 @@ ADMIT_SHIFT = ShiftDefinition(
     11,
     "ADMIT",
     time(12, 0),
-    time(17, 0),
+    time(18, 0),
     "On-Site",
     "Non-Scheduled",
     "Patient Care",
@@ -190,7 +208,7 @@ ADMIT_SHIFT = ShiftDefinition(
 VIRTUAL_SHIFT = ShiftDefinition(
     12,
     "VIRTUAL",
-    time(17, 0),
+    time(18, 0),
     time(21, 0),
     "Off-Site",
     "Non-Scheduled",
@@ -476,7 +494,11 @@ def to_clock_time(hour: int, minute: int, ampm: str) -> time:
     return time(hour, minute)
 
 
-def extract_evening_interval(cell_value: str, aliases: list[str]) -> tuple[time, time] | None:
+def extract_evening_interval(
+    cell_value: str,
+    aliases: list[str],
+    default: tuple[time, time] | None = None,
+) -> tuple[time, time] | None:
     if not any(alias_in_text(alias, cell_value) for alias in aliases):
         return None
     for segment in re.split(r"/|;", cell_value):
@@ -487,6 +509,8 @@ def extract_evening_interval(cell_value: str, aliases: list[str]) -> tuple[time,
     parsed = parse_time_expression(cell_value)
     if parsed:
         return parsed
+    if default is not None:
+        return default
     return EVENING_SHIFT.default_start, EVENING_SHIFT.default_end
 
 
@@ -539,7 +563,23 @@ def overnight_note(source_date: date, includes_evening: bool = False) -> str:
     return base
 
 
-def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, month: int, period: str) -> list[ShiftEntry]:
+def parse_master_schedule(
+    rows: list[list[str]],
+    aliases: list[str],
+    year: int,
+    month: int,
+    period: str,
+    shift_hours: dict[str, tuple[time, time]] | None = None,
+) -> list[ShiftEntry]:
+    if shift_hours is None:
+        shift_hours = load_shift_hours()
+    day_start, day_end = shift_hours["day"]
+    day_call_start, day_call_end = shift_hours["day_call"]
+    admit_start, admit_end = shift_hours["admit"]
+    virtual_start, virtual_end = shift_hours["virtual"]
+    overnight_start, overnight_end = shift_hours["overnight"]
+    evening_default = shift_hours["evening"]
+
     entries: list[ShiftEntry] = []
     current_year_month: tuple[int, int] | None = None
     order_counter = 0
@@ -562,18 +602,28 @@ def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, 
 
         evening_text = row[EVENING_SHIFT.column_index].strip()
         overnight_text = row[OVERNIGHT_SHIFT.column_index].strip()
-        evening_interval = extract_evening_interval(evening_text, aliases) if evening_text else None
+        evening_interval = (
+            extract_evening_interval(evening_text, aliases, default=evening_default)
+            if evening_text
+            else None
+        )
         overnight_match = row_matches_aliases(overnight_text, aliases)
 
         for definition in TEAM_SHIFTS + [ADMIT_SHIFT, VIRTUAL_SHIFT]:
             cell_value = row[definition.column_index].strip()
             if not row_matches_aliases(cell_value, aliases):
                 continue
-            start_time = definition.default_start
-            end_time = definition.default_end
-            if definition in TEAM_SHIFTS and is_on_call_day_shift(cell_value, aliases):
-                start_time = ON_CALL_DAY_SHIFT_START
-                end_time = ON_CALL_DAY_SHIFT_END
+            if definition in TEAM_SHIFTS:
+                start_time, end_time = day_start, day_end
+                if is_on_call_day_shift(cell_value, aliases):
+                    start_time, end_time = day_call_start, day_call_end
+            elif definition is ADMIT_SHIFT:
+                start_time, end_time = admit_start, admit_end
+            elif definition is VIRTUAL_SHIFT:
+                start_time, end_time = virtual_start, virtual_end
+            else:
+                start_time = definition.default_start
+                end_time = definition.default_end
             entries.append(
                 ShiftEntry(
                     service_date=service_date,
@@ -611,8 +661,8 @@ def parse_master_schedule(rows: list[list[str]], aliases: list[str], year: int, 
             entries.append(
                 ShiftEntry(
                     service_date=service_date + timedelta(days=1),
-                    start_time=OVERNIGHT_SHIFT.default_start,
-                    end_time=OVERNIGHT_SHIFT.default_end,
+                    start_time=overnight_start,
+                    end_time=overnight_end,
                     site_mode=OVERNIGHT_SHIFT.site_mode,
                     schedule_mode=OVERNIGHT_SHIFT.schedule_mode,
                     service_category=OVERNIGHT_SHIFT.service_category,
@@ -902,6 +952,71 @@ def record_usage_event(event_name: str) -> dict[str, object]:
         return metrics
 
 
+def parse_hhmm(value: object) -> time | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text in ("24:00", "2400"):
+        return time(0, 0)
+    match = re.fullmatch(r"(\d{1,2}):?(\d{2})", text)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour == 24 and minute == 0:
+        return time(0, 0)
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return time(hour, minute)
+    return None
+
+
+def format_hhmm(value: time) -> str:
+    return value.strftime("%H:%M")
+
+
+def load_shift_hours_unlocked() -> dict[str, tuple[time, time]]:
+    ensure_data_dir()
+    hours = {key: value for key, value in DEFAULT_SHIFT_HOURS.items()}
+    if SHIFT_HOURS_FILE.exists():
+        try:
+            loaded = json.loads(SHIFT_HOURS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            for key in hours:
+                entry = loaded.get(key)
+                if not isinstance(entry, dict):
+                    continue
+                start = parse_hhmm(entry.get("start"))
+                end = parse_hhmm(entry.get("end"))
+                if start is not None and end is not None:
+                    hours[key] = (start, end)
+    return hours
+
+
+def save_shift_hours_unlocked(hours: dict[str, tuple[time, time]]) -> None:
+    ensure_data_dir()
+    payload = {
+        key: {"start": format_hhmm(start), "end": format_hhmm(end)}
+        for key, (start, end) in hours.items()
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    temp_path = SHIFT_HOURS_FILE.with_suffix(".tmp")
+    temp_path.write_text(text, encoding="utf-8")
+    temp_path.replace(SHIFT_HOURS_FILE)
+
+
+def load_shift_hours() -> dict[str, tuple[time, time]]:
+    with SHIFT_HOURS_LOCK:
+        return load_shift_hours_unlocked()
+
+
+def save_shift_hours(hours: dict[str, tuple[time, time]]) -> None:
+    with SHIFT_HOURS_LOCK:
+        save_shift_hours_unlocked(hours)
+
+
 def format_usage_timestamp(raw_value: object) -> str:
     if not isinstance(raw_value, str) or not raw_value:
         return "Not yet"
@@ -1088,11 +1203,20 @@ def render_form(
     active_tab: str = "invoice",
     template_errors: list[str] | None = None,
     template_message: str | None = None,
+    settings_errors: list[str] | None = None,
+    settings_message: str | None = None,
+    settings_values: dict[str, dict[str, str]] | None = None,
 ) -> str:
     values = values or {}
     errors = errors or []
     template_errors = template_errors or []
-    active_tab = "templates" if active_tab == "templates" else "invoice"
+    settings_errors = settings_errors or []
+    if active_tab == "templates":
+        active_tab = "templates"
+    elif active_tab == "advanced":
+        active_tab = "advanced"
+    else:
+        active_tab = "invoice"
     checked_admin = set(values.get("clinical_admin_types", "").split(",")) if values.get("clinical_admin_types") else set()
     selected_month = int(values["month"]) if values.get("month", "").isdigit() else date.today().month
     period_value = values.get("period", "first")
@@ -1297,11 +1421,83 @@ def render_form(
         "</section>"
     )
 
-    main_content = (
-        f'<div class="grid">{invoice_panel}{invoice_side_panel}</div>'
-        if active_tab == "invoice"
-        else f'<div class="grid">{templates_panel}{templates_side_panel}</div>'
+    saved_shift_hours = load_shift_hours()
+    shift_hours_display: dict[str, dict[str, str]] = {}
+    for key, (start, end) in saved_shift_hours.items():
+        shift_hours_display[key] = {
+            "start": format_hhmm(start),
+            "end": format_hhmm(end),
+        }
+    if settings_values:
+        for key in shift_hours_display:
+            override = settings_values.get(key)
+            if isinstance(override, dict):
+                if "start" in override:
+                    shift_hours_display[key]["start"] = override["start"]
+                if "end" in override:
+                    shift_hours_display[key]["end"] = override["end"]
+
+    settings_error_html = alert_html(settings_errors)
+    settings_success_html = (
+        f'<div class="alert success"><strong>{html.escape(settings_message)}</strong></div>'
+        if settings_message
+        else ""
     )
+
+    setting_rows_html = []
+    for key, label in SHIFT_HOURS_LABELS.items():
+        default_start, default_end = DEFAULT_SHIFT_HOURS[key]
+        current = shift_hours_display[key]
+        default_note = f"Default: {format_hhmm(default_start)}–{format_hhmm(default_end)}"
+        setting_rows_html.append(
+            '<div class="shift-row">'
+            f'<div class="shift-label"><strong>{html.escape(label)}</strong>'
+            f'<span class="shift-meta">{html.escape(default_note)}</span></div>'
+            '<div class="shift-inputs">'
+            '<label>Start'
+            f'<input type="time" name="{html.escape(key)}_start" value="{html.escape(current["start"])}" required>'
+            '</label>'
+            '<label>End'
+            f'<input type="time" name="{html.escape(key)}_end" value="{html.escape(current["end"])}" required>'
+            '</label>'
+            '</div>'
+            '</div>'
+        )
+    settings_rows_html = "".join(setting_rows_html)
+
+    advanced_panel = f"""
+      <section class="panel">
+        {settings_error_html}
+        {settings_success_html}
+        <h2>Advanced Settings</h2>
+        <p class="hint">Customize the billed hours for each shift type. Times use 24-hour format. For shifts that end at midnight, enter <code>00:00</code> as the end time.</p>
+        <form method="post" action="/settings/shifts">
+          <div class="shift-grid">
+            {settings_rows_html}
+          </div>
+          <div class="actions">
+            <button type="submit">Save Shift Hours</button>
+            <button class="ghost" type="submit" name="reset" value="1">Reset to Defaults</button>
+          </div>
+        </form>
+      </section>
+    """
+
+    advanced_side_panel = (
+        '<section class="panel"><h2>Notes</h2>'
+        "<p>Day shift hours are used for regular team shifts (Team 1 through Team 9).</p>"
+        "<p>Day shift on-call hours apply only when the schedule entry is marked with <code>*C</code> after the name.</p>"
+        "<p>Evening hours act as a fallback: if the schedule cell specifies a time range (e.g. <code>1700-2300</code>), that explicit range is used instead.</p>"
+        "<p>ADMIT and VIRTUAL shifts use these hours unless the cell itself specifies otherwise.</p>"
+        "</section>"
+    )
+
+    if active_tab == "invoice":
+        main_content = f'<div class="grid">{invoice_panel}{invoice_side_panel}</div>'
+    elif active_tab == "templates":
+        main_content = f'<div class="grid">{templates_panel}{templates_side_panel}</div>'
+    else:
+        main_content = f'<div class="grid">{advanced_panel}{advanced_side_panel}</div>'
 
     return f"""<!doctype html>
 <html lang="en">
@@ -1508,6 +1704,43 @@ def render_form(
       border-radius: 18px;
       background: white;
     }}
+    .shift-grid {{
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      margin-top: 6px;
+    }}
+    .shift-row {{
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.6);
+    }}
+    .shift-label {{
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }}
+    .shift-meta {{
+      font-size: 0.82rem;
+      color: var(--muted);
+    }}
+    .shift-inputs {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 10px;
+    }}
+    .shift-inputs label {{
+      font-size: 0.82rem;
+      color: var(--muted);
+    }}
+    .shift-inputs input[type="time"] {{
+      width: 100%;
+      min-width: 0;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -1623,6 +1856,7 @@ def render_form(
     <div class="tabs">
       <a class="tab-link{' active' if active_tab == 'invoice' else ''}" href="/?tab=invoice">Generate Invoice</a>
       <a class="tab-link{' active' if active_tab == 'templates' else ''}" href="/?tab=templates">Templates</a>
+      <a class="tab-link{' active' if active_tab == 'advanced' else ''}" href="/?tab=advanced">Advanced Settings</a>
     </div>
     {main_content}
     <div class="footer-note">Created by Dr Bobby Gu MD with Codex</div>
@@ -1787,6 +2021,8 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             record_usage_event("page_views")
             requested_tab = parse_qs(parsed.query).get("tab", ["invoice"])[0]
+            if requested_tab not in ("invoice", "templates", "advanced"):
+                requested_tab = "invoice"
             self.respond_html(render_form(active_tab=requested_tab))
             return
         if parsed.path.startswith("/template-files/"):
@@ -1807,6 +2043,9 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/templates/upload":
             self.handle_template_upload()
+            return
+        if parsed.path == "/settings/shifts":
+            self.handle_settings_shifts()
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Page not found.")
 
@@ -1885,6 +2124,56 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
             self.respond_html(
                 render_form(active_tab="templates", template_errors=errors),
                 status=HTTPStatus.BAD_REQUEST,
+            )
+        finally:
+            if payload.uploaded_template_path and payload.uploaded_template_path.exists():
+                payload.uploaded_template_path.unlink(missing_ok=True)
+
+    def handle_settings_shifts(self) -> None:
+        payload = parse_form_payload(self)
+        try:
+            if collect_form_value(payload.values, "reset"):
+                hours = {key: value for key, value in DEFAULT_SHIFT_HOURS.items()}
+                save_shift_hours(hours)
+                self.respond_html(
+                    render_form(
+                        active_tab="advanced",
+                        settings_message="Shift hours reset to defaults.",
+                    )
+                )
+                return
+
+            hours: dict[str, tuple[time, time]] = {}
+            errors: list[str] = []
+            entered: dict[str, dict[str, str]] = {}
+            for key, label in SHIFT_HOURS_LABELS.items():
+                raw_start = collect_form_value(payload.values, f"{key}_start")
+                raw_end = collect_form_value(payload.values, f"{key}_end")
+                entered[key] = {"start": raw_start, "end": raw_end}
+                start_time_value = parse_hhmm(raw_start)
+                end_time_value = parse_hhmm(raw_end)
+                if start_time_value is None:
+                    errors.append(f"{label}: start time is invalid (use HH:MM).")
+                if end_time_value is None:
+                    errors.append(f"{label}: end time is invalid (use HH:MM).")
+                if start_time_value is not None and end_time_value is not None:
+                    hours[key] = (start_time_value, end_time_value)
+            if errors:
+                self.respond_html(
+                    render_form(
+                        active_tab="advanced",
+                        settings_errors=errors,
+                        settings_values=entered,
+                    ),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            save_shift_hours(hours)
+            self.respond_html(
+                render_form(
+                    active_tab="advanced",
+                    settings_message="Shift hours saved.",
+                )
             )
         finally:
             if payload.uploaded_template_path and payload.uploaded_template_path.exists():

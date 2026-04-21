@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 server-*.log
 data/usage_metrics.json
+data/shift_hours.json
