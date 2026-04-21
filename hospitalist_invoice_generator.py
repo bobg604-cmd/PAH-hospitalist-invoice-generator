@@ -1455,10 +1455,10 @@ def render_form(
             f'<span class="shift-meta">{html.escape(default_note)}</span></div>'
             '<div class="shift-inputs">'
             '<label>Start'
-            f'<input type="time" name="{html.escape(key)}_start" value="{html.escape(current["start"])}" required>'
+            f'<input type="text" inputmode="numeric" pattern="([01]?[0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" maxlength="5" name="{html.escape(key)}_start" value="{html.escape(current["start"])}" required>'
             '</label>'
             '<label>End'
-            f'<input type="time" name="{html.escape(key)}_end" value="{html.escape(current["end"])}" required>'
+            f'<input type="text" inputmode="numeric" pattern="([01]?[0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" maxlength="5" name="{html.escape(key)}_end" value="{html.escape(current["end"])}" required>'
             '</label>'
             '</div>'
             '</div>'
@@ -1737,9 +1737,10 @@ def render_form(
       font-size: 0.82rem;
       color: var(--muted);
     }}
-    .shift-inputs input[type="time"] {{
+    .shift-inputs input[type="text"] {{
       width: 100%;
       min-width: 0;
+      font-variant-numeric: tabular-nums;
     }}
     table {{
       width: 100%;
