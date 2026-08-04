@@ -62,6 +62,17 @@ That folder is ignored by Git, so generated invoices are not pushed to GitHub in
 
 If you host the app online, generated files are still created on the server, but they are meant to be downloaded right away rather than stored permanently.
 
+## Older Months And Archive Tabs
+
+The master Google Sheet keeps the current schedule on one tab and older months on
+archive tabs such as `2026 Archive`.
+
+You do not need to pick the right tab yourself. If the month you asked for is not
+on the tab the master schedule URL points at, the app searches the other tabs in
+the same workbook, archives included, and tells you which tab it used.
+
+Tabs that are not schedules, such as contact lists and surge lines, are ignored.
+
 ## Special Shift Rules
 
 The app uses these rules:

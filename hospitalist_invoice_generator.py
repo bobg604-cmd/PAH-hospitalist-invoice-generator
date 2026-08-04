@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import threading
 import time as time_module
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from email import policy
 from email.parser import BytesParser
@@ -98,6 +98,7 @@ for _month_number, _month_name in enumerate(MONTH_NAMES, start=1):
     MONTH_NAME_TO_NUMBER[_month_name[:3]] = _month_number
 MONTH_NAME_TO_NUMBER["sept"] = 9
 MONTH_HEADING_PATTERN = re.compile(r"^(?P<month>[A-Za-z]{3,9})\.?[\s\-/,]+(?P<year>\d{4}|\d{2})$")
+ISO_DATE_PATTERN = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 TEAM_HEADER_PATTERN = re.compile(r"^team\s*(\d+)$", re.IGNORECASE)
 SPECIAL_HEADER_KEYS = ("admit", "virtual", "evening", "overnight")
 HEADER_SEARCH_ROWS = 40
@@ -197,6 +198,8 @@ class GenerationResult:
     added_admin_rows: list[ShiftEntry]
     skipped_admin_messages: list[str]
     output_path: Path | None = None
+    source_tab: str | None = None
+    other_source_tabs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -547,16 +550,24 @@ def parse_admin_type_values(values: Iterable[str]) -> set[str]:
     return result
 
 
+def master_document_id(url: str) -> str:
+    match = re.search(r"/spreadsheets/d/([^/]+)", urlparse(url).path)
+    if not match:
+        raise ValueError("Could not extract the Google Sheets document id from the master URL.")
+    return match.group(1)
+
+
 def share_url_to_csv_url(url: str) -> str:
     if "export?format=csv" in url:
         return url
     parsed = urlparse(url)
-    match = re.search(r"/spreadsheets/d/([^/]+)", parsed.path)
-    if not match:
-        raise ValueError("Could not extract the Google Sheets document id from the master URL.")
-    doc_id = match.group(1)
+    doc_id = master_document_id(url)
     gid = parse_qs(parsed.query).get("gid", ["0"])[0]
     return f"https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv&gid={gid}"
+
+
+def share_url_to_xlsx_url(url: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{master_document_id(url)}/export?format=xlsx"
 
 
 def fetch_master_rows(url: str) -> list[list[str]]:
@@ -566,13 +577,58 @@ def fetch_master_rows(url: str) -> list[list[str]]:
     return list(csv.reader(io.StringIO(csv_text)))
 
 
+def cell_to_text(value: object) -> str:
+    """Render a workbook cell the way the CSV export of the same tab would.
+
+    Dates arrive as real date objects and whole numbers as floats, so day
+    numbers must not become `1.0` and month headings must stay parseable.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def fetch_master_tabs(url: str) -> list[tuple[str, str, list[list[str]]]]:
+    """Download every tab of the master workbook, archived and hidden ones included.
+
+    The CSV export only ever returns a single tab, so the whole workbook is
+    pulled as xlsx instead. Returns `(title, sheet_state, rows)` per tab.
+    """
+    ensure_openpyxl_available()
+    with urlopen(share_url_to_xlsx_url(url), timeout=120) as response:
+        payload = response.read()
+    workbook = load_workbook(io.BytesIO(payload), read_only=True, data_only=True)
+    try:
+        return [
+            (
+                sheet.title,
+                sheet.sheet_state,
+                [[cell_to_text(value) for value in row] for row in sheet.iter_rows(values_only=True)],
+            )
+            for sheet in workbook.worksheets
+        ]
+    finally:
+        workbook.close()
+
+
 def parse_month_heading(cell_value: str) -> tuple[int, int] | None:
     """Read a month heading cell.
 
     The master schedule is not consistent about how these are written, so this
-    accepts `August 2026`, `Aug 2026`, `Aug-26`, `Aug. 26` and similar.
+    accepts `August 2026`, `Aug 2026`, `Aug-26`, `Aug. 26` and similar. Some
+    headings are real dates rather than text, which reach here as `2026-08-01`
+    once the workbook is read; only the year and month matter either way.
     """
-    match = MONTH_HEADING_PATTERN.match(cell_value.strip())
+    value = cell_value.strip()
+    iso_match = ISO_DATE_PATTERN.match(value)
+    if iso_match:
+        year, month = int(iso_match.group(1)), int(iso_match.group(2))
+        return (year, month) if 1 <= month <= 12 else None
+    match = MONTH_HEADING_PATTERN.match(value)
     if not match:
         return None
     month = MONTH_NAME_TO_NUMBER.get(match.group("month").lower())
@@ -683,6 +739,90 @@ def months_available_in_rows(rows: list[list[str]]) -> list[tuple[int, int]]:
 
 def format_year_month(year: int, month: int) -> str:
     return f"{MONTH_NAMES[month - 1].title()} {year}"
+
+
+def no_shifts_message(
+    options: GenerationOptions,
+    aliases: list[str],
+    master_rows: list[list[str]],
+    plan: SchedulePlan,
+    search: TabSearch,
+) -> str:
+    requested = format_year_month(options.year, options.month)
+    if search.error:
+        months = ", ".join(format_year_month(*item) for item in months_available_in_rows(master_rows))
+        return (
+            f"No shifts matched {requested} on the selected tab (months there: {months or 'none found'}), "
+            f"and the other tabs of this workbook could not be searched: {search.error}"
+        )
+    if search.tabs_with_month:
+        found_on = search.tabs_with_month[0]
+        layout = search.tab_layouts.get(found_on, plan.describe())
+        return (
+            f"{requested} was found on {', '.join(search.tabs_with_month)}, but no shifts matched the "
+            f"schedule name or aliases ({', '.join(aliases)}). Try adjusting the schedule name or aliases. "
+            f"Columns read on {found_on} — {layout}."
+        )
+    return (
+        f"No tab in this master schedule contains {requested}. Searched {search.tabs_scanned} tabs including "
+        f"archives; the ones holding schedules were: {', '.join(search.schedule_tabs) or 'none'}. "
+        "Check the month and year, or whether that month has been added to the workbook yet."
+    )
+
+
+@dataclass
+class TabSearch:
+    """What a sweep of every workbook tab turned up."""
+
+    tabs_scanned: int = 0
+    schedule_tabs: list[str] = field(default_factory=list)
+    tabs_with_month: list[str] = field(default_factory=list)
+    tab_layouts: dict[str, str] = field(default_factory=dict)
+    matches: list[tuple[str, list[ShiftEntry]]] = field(default_factory=list)
+    error: str | None = None
+
+
+def search_all_tabs(
+    url: str,
+    aliases: list[str],
+    year: int,
+    month: int,
+    period: str,
+    shift_hours: dict[str, tuple[time, time]] | None = None,
+) -> TabSearch:
+    """Look for the requested month on every tab, including archives.
+
+    Tabs without a recognisable schedule header (contact lists, surge lines) are
+    skipped so they cannot contribute stray rows. Visible tabs are preferred
+    over hidden ones, which are usually superseded copies.
+    """
+    search = TabSearch()
+    if shift_hours is None:
+        shift_hours = load_shift_hours()
+    try:
+        tabs = fetch_master_tabs(url)
+    except Exception as exc:  # network, permissions, or an unreadable export
+        search.error = str(exc)
+        return search
+
+    ranked: list[tuple[int, str, list[ShiftEntry]]] = []
+    for title, state, rows in tabs:
+        search.tabs_scanned += 1
+        plan = detect_schedule_plan(rows)
+        if plan is None:
+            continue
+        search.schedule_tabs.append(title)
+        if (year, month) not in months_available_in_rows(rows):
+            continue
+        search.tabs_with_month.append(title)
+        search.tab_layouts[title] = plan.describe()
+        entries = parse_master_schedule(rows, aliases, year, month, period, shift_hours, plan=plan)
+        if entries:
+            ranked.append((0 if state == "visible" else 1, title, entries))
+
+    ranked.sort(key=lambda item: item[0])
+    search.matches = [(title, entries) for _, title, entries in ranked]
+    return search
 
 
 def overnight_note(source_date: date, includes_evening: bool = False) -> str:
@@ -1178,6 +1318,10 @@ def retry_on_permission_error(operation, *, attempts: int = 6, delay_seconds: fl
 
 
 def print_generation_summary(result: GenerationResult) -> None:
+    if result.source_tab:
+        print(f"Read from workbook tab: {result.source_tab}")
+        if result.other_source_tabs:
+            print(f"  This month also appears on: {', '.join(result.other_source_tabs)}")
     print(f"Matched {len(result.invoice_rows)} invoice rows.")
     for entry in result.invoice_rows:
         note_suffix = f" | note: {entry.note}" if entry.note else ""
@@ -1252,21 +1396,23 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
         options.period,
         plan=plan,
     )
+    source_tab: str | None = None
+    other_source_tabs: list[str] = []
     if not matched_shifts:
-        available = months_available_in_rows(master_rows)
-        requested = format_year_month(options.year, options.month)
-        if (options.year, options.month) not in available:
-            month_list = ", ".join(format_year_month(year, month) for year, month in available)
-            raise ValueError(
-                f"This master schedule tab does not contain {requested}. "
-                f"Months on this tab: {month_list or 'none found'}. "
-                "Pick a different month, or point the master schedule URL at the tab that covers it."
-            )
-        raise ValueError(
-            f"{requested} was found on the schedule, but no shifts matched the schedule name or aliases "
-            f"({', '.join(aliases)}). Try adjusting the schedule name or aliases. "
-            f"Columns read — {plan.describe()}."
+        # The tab the URL points at only carries the current schedule, so older
+        # months live on archive tabs elsewhere in the same workbook.
+        search = search_all_tabs(
+            options.master_url,
+            aliases,
+            options.year,
+            options.month,
+            options.period,
         )
+        if search.matches:
+            source_tab, matched_shifts = search.matches[0]
+            other_source_tabs = [title for title, _ in search.matches[1:]]
+        else:
+            raise ValueError(no_shifts_message(options, aliases, master_rows, plan, search))
 
     invoice_rows, added_admin_rows, skipped_admin_messages = build_invoice_rows(
         matched_shifts,
@@ -1281,6 +1427,8 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
         invoice_rows=invoice_rows,
         added_admin_rows=added_admin_rows,
         skipped_admin_messages=skipped_admin_messages,
+        source_tab=source_tab,
+        other_source_tabs=other_source_tabs,
     )
 
     if options.dry_run:
@@ -1422,10 +1570,20 @@ def render_form(
                 f'Workbook ready: <a href="/outputs/{quote(output_name)}">{html.escape(output_name)}</a>'
                 "</p>"
             )
+        source_tab_html = ""
+        if result.source_tab:
+            also = ""
+            if result.other_source_tabs:
+                also = " This month also appears on: " + html.escape(", ".join(result.other_source_tabs)) + "."
+            source_tab_html = (
+                "<p>That month was not on the selected tab, so it was read from the archived tab "
+                f"<strong>{html.escape(result.source_tab)}</strong>.{also}</p>"
+            )
         result_html = (
             '<section class="panel results">'
             "<h2>Generated Invoice</h2>"
             f"{output_html}"
+            f"{source_tab_html}"
             f"<p>Matched {len(result.matched_shifts)} source shifts and added {len(result.added_admin_rows)} clinical admin rows.</p>"
             '<div class="table-wrap"><table><thead><tr>'
             "<th>Date</th><th>Start</th><th>End</th><th>Mode</th><th>Schedule</th><th>Category</th><th>Notes</th>"
