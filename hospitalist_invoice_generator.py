@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import threading
 import time as time_module
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from email import policy
 from email.parser import BytesParser
@@ -78,6 +78,29 @@ SHIFT_HOURS_LABELS: dict[str, str] = {
     "admit": "ADMIT shift",
     "virtual": "VIRTUAL shift",
 }
+MONTH_NAMES = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
+MONTH_NAME_TO_NUMBER: dict[str, int] = {}
+for _month_number, _month_name in enumerate(MONTH_NAMES, start=1):
+    MONTH_NAME_TO_NUMBER[_month_name] = _month_number
+    MONTH_NAME_TO_NUMBER[_month_name[:3]] = _month_number
+MONTH_NAME_TO_NUMBER["sept"] = 9
+MONTH_HEADING_PATTERN = re.compile(r"^(?P<month>[A-Za-z]{3,9})\.?[\s\-/,]+(?P<year>\d{4}|\d{2})$")
+TEAM_HEADER_PATTERN = re.compile(r"^team\s*(\d+)$", re.IGNORECASE)
+SPECIAL_HEADER_KEYS = ("admit", "virtual", "evening", "overnight")
+HEADER_SEARCH_ROWS = 40
 ADMIN_TYPE_LABELS = {
     "scheduled": "Scheduled daytime/team shifts",
     "evening": "Evening shifts",
@@ -235,6 +258,88 @@ OVERNIGHT_SHIFT = ShiftDefinition(
     "Patient Care",
     ("overnight",),
 )
+
+
+@dataclass(frozen=True)
+class SchedulePlan:
+    """Which spreadsheet column holds each shift type.
+
+    The master schedule gains and loses team columns over time, so the layout is
+    read from the sheet's own header row instead of being assumed.
+    """
+
+    teams: tuple[ShiftDefinition, ...]
+    admit: ShiftDefinition | None
+    virtual: ShiftDefinition | None
+    evening: ShiftDefinition | None
+    overnight: ShiftDefinition | None
+    detected: bool
+
+    def named_shifts(self) -> tuple[ShiftDefinition, ...]:
+        return tuple(item for item in (self.admit, self.virtual, self.evening, self.overnight) if item)
+
+    def all_shifts(self) -> tuple[ShiftDefinition, ...]:
+        return self.teams + self.named_shifts()
+
+    def required_row_length(self) -> int:
+        columns = [definition.column_index for definition in self.all_shifts()]
+        return max(columns) + 1 if columns else 2
+
+    def describe(self) -> str:
+        parts = [f"{definition.label}=col {definition.column_index + 1}" for definition in self.all_shifts()]
+        source = "detected from the sheet header" if self.detected else "built-in fallback layout"
+        return f"{source}: " + ", ".join(parts)
+
+
+DEFAULT_SCHEDULE_PLAN = SchedulePlan(
+    teams=tuple(TEAM_SHIFTS),
+    admit=ADMIT_SHIFT,
+    virtual=VIRTUAL_SHIFT,
+    evening=EVENING_SHIFT,
+    overnight=OVERNIGHT_SHIFT,
+    detected=False,
+)
+
+
+def detect_schedule_plan(rows: list[list[str]]) -> SchedulePlan | None:
+    """Locate the header row and map each shift type to its actual column."""
+    for row in rows[:HEADER_SEARCH_ROWS]:
+        if not row:
+            continue
+        team_columns: list[tuple[int, int]] = []
+        special_columns: dict[str, int] = {}
+        for index, cell in enumerate(row):
+            label = cell.strip()
+            if not label:
+                continue
+            team_match = TEAM_HEADER_PATTERN.match(label)
+            if team_match:
+                team_columns.append((int(team_match.group(1)), index))
+                continue
+            key = label.lower()
+            if key in SPECIAL_HEADER_KEYS and key not in special_columns:
+                special_columns[key] = index
+        if not team_columns or "overnight" not in special_columns:
+            continue
+
+        teams = tuple(
+            replace(TEAM_SHIFTS[0], column_index=index, label=f"Team {number}")
+            for number, index in sorted(team_columns)
+        )
+
+        def column_for(key: str, template: ShiftDefinition) -> ShiftDefinition | None:
+            index = special_columns.get(key)
+            return replace(template, column_index=index) if index is not None else None
+
+        return SchedulePlan(
+            teams=teams,
+            admit=column_for("admit", ADMIT_SHIFT),
+            virtual=column_for("virtual", VIRTUAL_SHIFT),
+            evening=column_for("evening", EVENING_SHIFT),
+            overnight=column_for("overnight", OVERNIGHT_SHIFT),
+            detected=True,
+        )
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -462,12 +567,21 @@ def fetch_master_rows(url: str) -> list[list[str]]:
 
 
 def parse_month_heading(cell_value: str) -> tuple[int, int] | None:
-    value = cell_value.strip()
-    try:
-        parsed = datetime.strptime(value, "%B %Y")
-    except ValueError:
+    """Read a month heading cell.
+
+    The master schedule is not consistent about how these are written, so this
+    accepts `August 2026`, `Aug 2026`, `Aug-26`, `Aug. 26` and similar.
+    """
+    match = MONTH_HEADING_PATTERN.match(cell_value.strip())
+    if not match:
         return None
-    return parsed.year, parsed.month
+    month = MONTH_NAME_TO_NUMBER.get(match.group("month").lower())
+    if month is None:
+        return None
+    year = int(match.group("year"))
+    if year < 100:
+        year += 2000
+    return year, month
 
 
 def parse_time_expression(part: str) -> tuple[time, time] | None:
@@ -543,16 +657,32 @@ def row_matches_aliases(row_value: str, aliases: list[str]) -> bool:
     return bool(row_value and any(alias_in_text(alias, row_value) for alias in aliases))
 
 
-def shift_note_for_definition(definition: ShiftDefinition) -> str | None:
-    if definition in TEAM_SHIFTS:
+def shift_note_for_definition(definition: ShiftDefinition, plan: SchedulePlan) -> str | None:
+    if definition in plan.teams:
         return definition.label
-    if definition is ADMIT_SHIFT:
+    if definition is plan.admit:
         return "Admit Pilot"
-    if definition is VIRTUAL_SHIFT:
+    if definition is plan.virtual:
         return "Virtual"
-    if definition is EVENING_SHIFT:
+    if definition is plan.evening:
         return "Evening"
     return None
+
+
+def months_available_in_rows(rows: list[list[str]]) -> list[tuple[int, int]]:
+    """List the month blocks a sheet tab actually contains, in order."""
+    found: list[tuple[int, int]] = []
+    for row in rows:
+        if not row or not row[0]:
+            continue
+        heading = parse_month_heading(row[0])
+        if heading and heading not in found:
+            found.append(heading)
+    return found
+
+
+def format_year_month(year: int, month: int) -> str:
+    return f"{MONTH_NAMES[month - 1].title()} {year}"
 
 
 def overnight_note(source_date: date, includes_evening: bool = False) -> str:
@@ -570,9 +700,13 @@ def parse_master_schedule(
     month: int,
     period: str,
     shift_hours: dict[str, tuple[time, time]] | None = None,
+    plan: SchedulePlan | None = None,
 ) -> list[ShiftEntry]:
     if shift_hours is None:
         shift_hours = load_shift_hours()
+    if plan is None:
+        plan = detect_schedule_plan(rows) or DEFAULT_SCHEDULE_PLAN
+    required_length = plan.required_row_length()
     day_start, day_end = shift_hours["day"]
     day_call_start, day_call_end = shift_hours["day_call"]
     admit_start, admit_end = shift_hours["admit"]
@@ -591,7 +725,7 @@ def parse_master_schedule(
         if heading:
             current_year_month = heading
             continue
-        if current_year_month is None or len(row) < 15:
+        if current_year_month is None or len(row) < required_length:
             continue
         if not row[1].strip().isdigit():
             continue
@@ -600,8 +734,8 @@ def parse_master_schedule(
         if not date_in_requested_period(service_date, year, month, period):
             continue
 
-        evening_text = row[EVENING_SHIFT.column_index].strip()
-        overnight_text = row[OVERNIGHT_SHIFT.column_index].strip()
+        evening_text = row[plan.evening.column_index].strip() if plan.evening else ""
+        overnight_text = row[plan.overnight.column_index].strip() if plan.overnight else ""
         evening_interval = (
             extract_evening_interval(evening_text, aliases, default=evening_default)
             if evening_text
@@ -609,17 +743,18 @@ def parse_master_schedule(
         )
         overnight_match = row_matches_aliases(overnight_text, aliases)
 
-        for definition in TEAM_SHIFTS + [ADMIT_SHIFT, VIRTUAL_SHIFT]:
+        day_definitions = list(plan.teams) + [item for item in (plan.admit, plan.virtual) if item]
+        for definition in day_definitions:
             cell_value = row[definition.column_index].strip()
             if not row_matches_aliases(cell_value, aliases):
                 continue
-            if definition in TEAM_SHIFTS:
+            if definition in plan.teams:
                 start_time, end_time = day_start, day_end
                 if is_on_call_day_shift(cell_value, aliases):
                     start_time, end_time = day_call_start, day_call_end
-            elif definition is ADMIT_SHIFT:
+            elif definition is plan.admit:
                 start_time, end_time = admit_start, admit_end
-            elif definition is VIRTUAL_SHIFT:
+            elif definition is plan.virtual:
                 start_time, end_time = virtual_start, virtual_end
             else:
                 start_time = definition.default_start
@@ -632,7 +767,7 @@ def parse_master_schedule(
                     site_mode=definition.site_mode,
                     schedule_mode=definition.schedule_mode,
                     service_category=definition.service_category,
-                    note=shift_note_for_definition(definition),
+                    note=shift_note_for_definition(definition, plan),
                     source=definition.label,
                     admin_categories=definition.admin_categories,
                     display_order=order_counter,
@@ -640,35 +775,35 @@ def parse_master_schedule(
             )
             order_counter += 1
 
-        if evening_interval:
+        if evening_interval and plan.evening:
             entries.append(
                 ShiftEntry(
                     service_date=service_date,
                     start_time=evening_interval[0],
                     end_time=evening_interval[1],
-                    site_mode=EVENING_SHIFT.site_mode,
-                    schedule_mode=EVENING_SHIFT.schedule_mode,
-                    service_category=EVENING_SHIFT.service_category,
-                    note=shift_note_for_definition(EVENING_SHIFT),
+                    site_mode=plan.evening.site_mode,
+                    schedule_mode=plan.evening.schedule_mode,
+                    service_category=plan.evening.service_category,
+                    note=shift_note_for_definition(plan.evening, plan),
                     source="Evening",
-                    admin_categories=EVENING_SHIFT.admin_categories,
+                    admin_categories=plan.evening.admin_categories,
                     display_order=order_counter,
                 )
             )
             order_counter += 1
 
-        if overnight_match:
+        if overnight_match and plan.overnight:
             entries.append(
                 ShiftEntry(
                     service_date=service_date + timedelta(days=1),
                     start_time=overnight_start,
                     end_time=overnight_end,
-                    site_mode=OVERNIGHT_SHIFT.site_mode,
-                    schedule_mode=OVERNIGHT_SHIFT.schedule_mode,
-                    service_category=OVERNIGHT_SHIFT.service_category,
+                    site_mode=plan.overnight.site_mode,
+                    schedule_mode=plan.overnight.schedule_mode,
+                    service_category=plan.overnight.service_category,
                     note=overnight_note(service_date),
                     source="Overnight",
-                    admin_categories=OVERNIGHT_SHIFT.admin_categories,
+                    admin_categories=plan.overnight.admin_categories,
                     display_order=order_counter,
                 )
             )
@@ -1108,11 +1243,29 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
             aliases.append(alias)
 
     master_rows = fetch_master_rows(options.master_url)
-    matched_shifts = parse_master_schedule(master_rows, aliases, options.year, options.month, options.period)
+    plan = detect_schedule_plan(master_rows) or DEFAULT_SCHEDULE_PLAN
+    matched_shifts = parse_master_schedule(
+        master_rows,
+        aliases,
+        options.year,
+        options.month,
+        options.period,
+        plan=plan,
+    )
     if not matched_shifts:
+        available = months_available_in_rows(master_rows)
+        requested = format_year_month(options.year, options.month)
+        if (options.year, options.month) not in available:
+            month_list = ", ".join(format_year_month(year, month) for year, month in available)
+            raise ValueError(
+                f"This master schedule tab does not contain {requested}. "
+                f"Months on this tab: {month_list or 'none found'}. "
+                "Pick a different month, or point the master schedule URL at the tab that covers it."
+            )
         raise ValueError(
-            "No shifts matched the requested physician, schedule name/aliases, and date range. "
-            "Try adjusting the schedule name or aliases."
+            f"{requested} was found on the schedule, but no shifts matched the schedule name or aliases "
+            f"({', '.join(aliases)}). Try adjusting the schedule name or aliases. "
+            f"Columns read — {plan.describe()}."
         )
 
     invoice_rows, added_admin_rows, skipped_admin_messages = build_invoice_rows(
