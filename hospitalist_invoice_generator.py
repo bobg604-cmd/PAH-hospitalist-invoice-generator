@@ -200,6 +200,7 @@ class GenerationResult:
     output_path: Path | None = None
     source_tab: str | None = None
     other_source_tabs: list[str] = field(default_factory=list)
+    adjustment_messages: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -967,6 +968,46 @@ def overlaps_interval(candidate_start: datetime, candidate_end: datetime, occupi
     return False
 
 
+def resolve_overnight_day_overlap(shifts: list[ShiftEntry]) -> list[str]:
+    """Stop an on-call day shift from overlapping that morning's overnight shift.
+
+    An overnight runs to 07:00 and an on-call day shift starts at 06:30, so
+    working both bills 06:30-07:00 twice, which is not allowed. The day shift is
+    moved to start when the overnight ends, giving 07:00-17:30.
+    """
+    overnight_ends: dict[date, time] = {}
+    for shift in shifts:
+        if "overnight" not in shift.admin_categories:
+            continue
+        _, end_dt = actual_interval(shift)
+        if end_dt.date() != shift.service_date:
+            continue
+        previous = overnight_ends.get(shift.service_date)
+        if previous is None or shift.end_time > previous:
+            overnight_ends[shift.service_date] = shift.end_time
+
+    messages: list[str] = []
+    for shift in shifts:
+        if "scheduled" not in shift.admin_categories:
+            continue
+        overnight_end = overnight_ends.get(shift.service_date)
+        if overnight_end is None:
+            continue
+        if not shift.start_time < overnight_end < shift.end_time:
+            continue
+        original_start = shift.start_time
+        shift.start_time = overnight_end
+        messages.append(
+            f"{shift.service_date.isoformat()} {shift.source} now starts at "
+            f"{overnight_end.strftime('%H:%M')} instead of {original_start.strftime('%H:%M')} "
+            "so it does not overlap the overnight shift."
+        )
+
+    if messages:
+        shifts.sort(key=lambda item: (item.service_date, item.start_time, item.display_order))
+    return messages
+
+
 def clinical_admin_site_mode(shift: ShiftEntry) -> str:
     if "virtual" in shift.admin_categories:
         return "Off-Site"
@@ -1329,6 +1370,10 @@ def print_generation_summary(result: GenerationResult) -> None:
             f"  {entry.service_date.isoformat()} | {entry.start_time.strftime('%H:%M')}-{entry.end_time.strftime('%H:%M')} | "
             f"{entry.site_mode} | {entry.schedule_mode} | {entry.service_category} | {entry.source}{note_suffix}"
         )
+    if result.adjustment_messages:
+        print("\nAdjusted to avoid overlapping hours:")
+        for message in result.adjustment_messages:
+            print(f"  - {message}")
     if result.skipped_admin_messages:
         print("\nClinical admin skipped:")
         for message in result.skipped_admin_messages:
@@ -1414,6 +1459,8 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
         else:
             raise ValueError(no_shifts_message(options, aliases, master_rows, plan, search))
 
+    adjustment_messages = resolve_overnight_day_overlap(matched_shifts)
+
     invoice_rows, added_admin_rows, skipped_admin_messages = build_invoice_rows(
         matched_shifts,
         options.clinical_admin_types,
@@ -1429,6 +1476,7 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
         skipped_admin_messages=skipped_admin_messages,
         source_tab=source_tab,
         other_source_tabs=other_source_tabs,
+        adjustment_messages=adjustment_messages,
     )
 
     if options.dry_run:
@@ -1559,9 +1607,12 @@ def render_form(
                 "</tr>"
             )
         skipped_html = ""
+        if result.adjustment_messages:
+            adjustment_items = "".join(f"<li>{html.escape(message)}</li>" for message in result.adjustment_messages)
+            skipped_html += f"<h3>Adjusted To Avoid Overlapping Hours</h3><ul>{adjustment_items}</ul>"
         if result.skipped_admin_messages:
             skipped_items = "".join(f"<li>{html.escape(message)}</li>" for message in result.skipped_admin_messages)
-            skipped_html = f"<h3>Skipped Clinical Admin</h3><ul>{skipped_items}</ul>"
+            skipped_html += f"<h3>Skipped Clinical Admin</h3><ul>{skipped_items}</ul>"
         output_html = ""
         if result.output_path:
             output_name = result.output_path.name

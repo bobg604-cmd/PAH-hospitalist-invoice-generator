@@ -79,6 +79,7 @@ The app uses these rules:
 
 - regular day/team shifts are `07:00-17:00`
 - if a day-shift entry has `*C` after the name, such as `Grewal*C`, that day is billed as `06:30-17:30`
+- if you also worked the overnight into that same morning, the `*C` day shift starts when the overnight ends, so it is billed as `07:00-17:30` instead, because the same half hour cannot be billed twice
 - `VIRTUAL` shifts are billed as `17:00-21:00` and are `Off-Site`
 - clinical admin is `Off-Site` only when it follows a `VIRTUAL` shift
 - clinical admin is `On-Site` for the other supported shift types
