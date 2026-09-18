@@ -56,7 +56,13 @@ DEFAULT_MASTER_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1DlDnljstmxsqgJyKTU0eWdl4-YBRQvm3eaE7PENVVRE/edit?gid=61161592"
 )
-BUNDLED_TEMPLATE = TEMPLATE_DIR / "FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx"
+LEGACY_TEMPLATE = TEMPLATE_DIR / "FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx"
+CURRENT_TEMPLATE = TEMPLATE_DIR / "FHA Invoice - Hospitalist V3.xlsx"
+# The department reissued the invoice workbook, with higher after-hours rates, for
+# reporting periods from October 2026 onward. Earlier periods must keep billing at
+# the old rates, so they keep using the previous workbook.
+CURRENT_TEMPLATE_FIRST_PERIOD = (2026, 10)
+AUTO_TEMPLATE_CHOICE = "__auto__"
 START_ROW = 18
 END_ROW = 217
 ADMIN_MINUTES = 15
@@ -355,7 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serve", action="store_true", help="Launch the local web form instead of running one-off CLI mode.")
     parser.add_argument("--host", default=default_host, help="Host for web mode.")
     parser.add_argument("--port", type=int, default=default_port, help="Port for web mode.")
-    parser.add_argument("--template", type=Path, default=BUNDLED_TEMPLATE, help="Path to an existing invoice workbook.")
+    parser.add_argument(
+        "--template",
+        type=Path,
+        default=None,
+        help="Path to an existing invoice workbook. Defaults to the bundled workbook for the reporting period.",
+    )
     parser.add_argument("--master-url", default=DEFAULT_MASTER_URL, help="Google Sheets share or export URL.")
     parser.add_argument("--physician-name", help="Physician legal name for the invoice header.")
     parser.add_argument("--first-name", help="First name for the invoice header.")
@@ -1181,20 +1192,48 @@ def list_available_templates() -> list[Path]:
     return sorted(templates, key=lambda path: path.name.lower())
 
 
-def get_active_template() -> Path:
-    ensure_template_dir()
+def selected_template_override() -> Path | None:
+    """The template a user explicitly picked in the Templates tab, if any."""
     if TEMPLATE_SETTINGS_FILE.exists():
         selected_name = TEMPLATE_SETTINGS_FILE.read_text(encoding="utf-8").strip()
         if selected_name:
             candidate = TEMPLATE_DIR / selected_name
             if candidate.exists():
                 return candidate
-    if BUNDLED_TEMPLATE.exists():
-        return BUNDLED_TEMPLATE
+    return None
+
+
+def bundled_template_for_period(year: int, month: int) -> Path:
+    """Pick the bundled workbook that matches the rates in force for that reporting period."""
+    if (year, month) >= CURRENT_TEMPLATE_FIRST_PERIOD:
+        preferred, fallback = CURRENT_TEMPLATE, LEGACY_TEMPLATE
+    else:
+        preferred, fallback = LEGACY_TEMPLATE, CURRENT_TEMPLATE
+    if preferred.exists():
+        return preferred
+    return fallback
+
+
+def template_period_label(year: int, month: int) -> str:
+    switch_label = date(*CURRENT_TEMPLATE_FIRST_PERIOD, 1).strftime("%B %Y")
+    if (year, month) >= CURRENT_TEMPLATE_FIRST_PERIOD:
+        return f"current workbook, used for {switch_label} onward"
+    return f"previous workbook, used for periods before {switch_label}"
+
+
+def get_active_template(year: int | None = None, month: int | None = None) -> Path:
+    ensure_template_dir()
+    override = selected_template_override()
+    if override is not None:
+        return override
+    if year is not None and month is not None:
+        return bundled_template_for_period(year, month)
+    if CURRENT_TEMPLATE.exists():
+        return CURRENT_TEMPLATE
     templates = list_available_templates()
     if templates:
         return templates[0]
-    return BUNDLED_TEMPLATE
+    return CURRENT_TEMPLATE
 
 
 def set_active_template(template_name: str) -> Path:
@@ -1204,6 +1243,12 @@ def set_active_template(template_name: str) -> Path:
         raise FileNotFoundError(f"Template not found: {target.name}")
     TEMPLATE_SETTINGS_FILE.write_text(target.name, encoding="utf-8")
     return target
+
+
+def clear_active_template() -> None:
+    """Go back to picking the bundled workbook from the reporting period."""
+    ensure_template_dir()
+    TEMPLATE_SETTINGS_FILE.unlink(missing_ok=True)
 
 
 def ensure_data_dir() -> None:
@@ -1359,6 +1404,7 @@ def retry_on_permission_error(operation, *, attempts: int = 6, delay_seconds: fl
 
 
 def print_generation_summary(result: GenerationResult) -> None:
+    print(f"Using invoice template: {result.options.template.name}")
     if result.source_tab:
         print(f"Read from workbook tab: {result.source_tab}")
         if result.other_source_tabs:
@@ -1398,7 +1444,7 @@ def build_generation_options_from_args(args: argparse.Namespace) -> GenerationOp
     clinical_admin_types = prompt_for_admin_types(args.clinical_admin_type)
 
     return GenerationOptions(
-        template=args.template,
+        template=args.template or bundled_template_for_period(year, month),
         master_url=args.master_url,
         physician_name=physician_name,
         first_name=first_name,
@@ -1570,9 +1616,23 @@ def render_form(
     selected_month = int(values["month"]) if values.get("month", "").isdigit() else date.today().month
     period_value = values.get("period", "first")
     current_year = date.today().year
+    selected_year = int(values["year"]) if values.get("year", "").isdigit() else current_year
     available_templates = list_available_templates()
-    active_template = get_active_template()
+    template_override = selected_template_override()
+    active_template = template_override or bundled_template_for_period(selected_year, selected_month)
     active_template_name = active_template.name if active_template else "No template selected"
+    template_switch_label = date(*CURRENT_TEMPLATE_FIRST_PERIOD, 1).strftime("%B %Y")
+    if template_override is not None:
+        template_choice_hint = (
+            f"Using <strong>{html.escape(active_template_name)}</strong> for every period, "
+            "because it was picked by hand in the Templates tab."
+        )
+    else:
+        template_choice_hint = (
+            f"Using <strong>{html.escape(active_template_name)}</strong>, "
+            f"the {html.escape(template_period_label(selected_year, selected_month))}. "
+            "The workbook is chosen from the reporting period above."
+        )
     def field(name: str, default: str = "") -> str:
         return html.escape(values.get(name, default))
 
@@ -1635,6 +1695,7 @@ def render_form(
             "<h2>Generated Invoice</h2>"
             f"{output_html}"
             f"{source_tab_html}"
+            f"<p>Built from <strong>{html.escape(result.options.template.name)}</strong>.</p>"
             f"<p>Matched {len(result.matched_shifts)} source shifts and added {len(result.added_admin_rows)} clinical admin rows.</p>"
             '<div class="table-wrap"><table><thead><tr>'
             "<th>Date</th><th>Start</th><th>End</th><th>Mode</th><th>Schedule</th><th>Category</th><th>Notes</th>"
@@ -1645,17 +1706,37 @@ def render_form(
             "</section>"
         )
 
-    template_cards = []
+    auto_checked_attr = " checked" if template_override is None else ""
+    auto_status = '<span class="active-pill">Active</span>' if template_override is None else ""
+    template_cards = [
+        '<label class="template-option">'
+        f'<span class="template-option-main"><input type="radio" name="template_name" value="{AUTO_TEMPLATE_CHOICE}"{auto_checked_attr}>'
+        f'<span><strong>Match the reporting period</strong><span class="badge">Recommended</span>{auto_status}'
+        '<span class="template-meta">Picks the bundled workbook that matches the rates in force for the month being invoiced.</span>'
+        "</span></span></label>"
+    ]
     for template_path in available_templates:
         template_name = template_path.name
         download_url = f"/template-files/{quote(template_name)}"
-        badge = '<span class="badge">Bundled default</span>' if template_name == BUNDLED_TEMPLATE.name else ""
-        status = '<span class="active-pill">Active</span>' if template_path == active_template else ""
-        checked_attr = " checked" if template_path == active_template else ""
+        if template_path == CURRENT_TEMPLATE:
+            badge = '<span class="badge">Bundled default</span>'
+            meta = f"Used automatically for reporting periods from {template_switch_label} onward."
+        elif template_path == LEGACY_TEMPLATE:
+            badge = '<span class="badge">Bundled, earlier periods</span>'
+            meta = f"Used automatically for reporting periods before {template_switch_label}."
+        else:
+            badge = ""
+            meta = "Stored in the app and available to all users of this deployment."
+        status = (
+            '<span class="active-pill">Active</span>'
+            if template_override is not None and template_path == template_override
+            else ""
+        )
+        checked_attr = " checked" if template_override is not None and template_path == template_override else ""
         template_cards.append(
             '<label class="template-option">'
             f'<span class="template-option-main"><input type="radio" name="template_name" value="{html.escape(template_name)}"{checked_attr}>'
-            f'<span><strong>{html.escape(template_name)}</strong>{badge}{status}<span class="template-meta">Stored in the app and available to all users of this deployment.</span></span></span>'
+            f'<span><strong>{html.escape(template_name)}</strong>{badge}{status}<span class="template-meta">{html.escape(meta)}</span></span></span>'
             f'<a href="{download_url}">Download</a>'
             "</label>"
         )
@@ -1728,7 +1809,7 @@ def render_form(
         <label>Master Schedule URL
           <input name="master_url" value="{field('master_url', DEFAULT_MASTER_URL)}" required>
         </label>
-        <p class="hint">Using active template: <strong>{html.escape(active_template_name)}</strong>. Change it in the Templates tab if needed.</p>
+        <p class="hint">{template_choice_hint} Change it in the Templates tab if needed.</p>
         <div class="actions">
           <button type="submit">Generate Workbook</button>
           <button class="ghost" type="button" onclick="window.location='/'">Reset</button>
@@ -1750,11 +1831,12 @@ def render_form(
         {template_error_html}
         {template_success_html}
         <h2>Templates</h2>
-        <p class="hint">The active template is used automatically when anyone generates an invoice.</p>
+        <p class="hint">By default the app picks the workbook that matches the month being invoiced, because the department raised the after-hours rates from {html.escape(template_switch_label)}. Most people should leave this alone.</p>
         <div class="template-current">
           <span class="section-title">Current Active Template</span>
-          <strong>{html.escape(active_template_name)}</strong>
-          <span class="template-meta">Bundled default: {html.escape(BUNDLED_TEMPLATE.name)}</span>
+          <strong>{html.escape(template_override.name if template_override else "Match the reporting period")}</strong>
+          <span class="template-meta">{html.escape(template_switch_label)} onward: {html.escape(CURRENT_TEMPLATE.name)}</span>
+          <span class="template-meta">Before {html.escape(template_switch_label)}: {html.escape(LEGACY_TEMPLATE.name)}</span>
         </div>
         <form method="post" action="/templates/select">
           <div class="template-list">{template_list_html}</div>
@@ -1777,8 +1859,10 @@ def render_form(
 
     templates_side_panel = (
         '<section class="panel"><h2>Template Notes</h2>'
-        "<p>The bundled PAH template stays available here as the default reference workbook.</p>"
-        "<p>You can switch back to it at any time, or upload a different workbook for the whole deployment to use.</p>"
+        f"<p>The department reissued the invoice workbook for {html.escape(template_switch_label)} onward, with higher after-hours rates.</p>"
+        "<p>Both bundled workbooks stay here. Leaving the choice on <strong>Match the reporting period</strong> means an "
+        "invoice for an earlier month still bills at the rates that applied then.</p>"
+        "<p>Picking one workbook by hand, or uploading your own, overrides that for every period until you switch back.</p>"
         "<p>This is intended for PAH hospitalists. Other sites may work, but they have not been tested yet.</p>"
         "</section>"
     )
@@ -2275,7 +2359,7 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     if month < 1 or month > 12:
         raise ValueError("Month must be between 1 and 12.")
 
-    template_path = uploaded_template_path or get_active_template()
+    template_path = uploaded_template_path or get_active_template(year, month)
     if template_path is None:
         raise ValueError("Template workbook not found.")
     master_url = collect_form_value(data, "master_url", DEFAULT_MASTER_URL)
@@ -2440,12 +2524,18 @@ class InvoiceRequestHandler(BaseHTTPRequestHandler):
         try:
             if not template_name:
                 raise ValueError("Please select a template first.")
-            active_template = set_active_template(template_name)
-            record_usage_event("template_selects")
+            if template_name == AUTO_TEMPLATE_CHOICE:
+                clear_active_template()
+                record_usage_event("template_selects")
+                message = "Templates now follow the reporting period again."
+            else:
+                active_template = set_active_template(template_name)
+                record_usage_event("template_selects")
+                message = f"Active template changed to {active_template.name} for every reporting period."
             self.respond_html(
                 render_form(
                     active_tab="templates",
-                    template_message=f"Active template changed to {active_template.name}.",
+                    template_message=message,
                 )
             )
         except Exception as exc:  # noqa: BLE001

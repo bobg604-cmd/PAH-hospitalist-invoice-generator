@@ -44,9 +44,11 @@ You can also add schedule aliases if your name appears in more than one way on t
 The website also has a `Templates` tab where you can:
 
 - see which invoice template is currently active
-- download the bundled default PAH template
+- download either bundled PAH template
 - switch to another saved template
 - upload a new template and make it the active one
+
+Most people never need to open that tab. See `Which Invoice Template Is Used` below.
 
 Example:
 
@@ -72,6 +74,26 @@ on the tab the master schedule URL points at, the app searches the other tabs in
 the same workbook, archives included, and tells you which tab it used.
 
 Tabs that are not schedules, such as contact lists and surge lines, are ignored.
+
+## Which Invoice Template Is Used
+
+The department reissued the invoice workbook, with higher after-hours rates, for
+reporting periods from October 2026 onward.
+
+The app keeps both workbooks and picks the right one from the month you are
+invoicing:
+
+- October 2026 and later: `FHA Invoice - Hospitalist V3.xlsx`
+- September 2026 and earlier: `FHA Invoice 2025 Hospitalist All Hours Final - 02172026.xlsx`
+
+You do not need to choose. Billing an earlier month still uses the rates that
+applied then, which is what you want when a late or corrected invoice goes in.
+
+The results page tells you which workbook the invoice was built from.
+
+If you do pick one workbook by hand in the `Templates` tab, or upload your own,
+that choice applies to every reporting period until you set the tab back to
+`Match the reporting period`.
 
 ## Special Shift Rules
 
@@ -160,7 +182,7 @@ This project can be hosted on Railway so users can open a website instead of ins
 On Railway:
 
 - users open a website instead of double-clicking the `.bat` file
-- the bundled invoice template is used automatically
+- the bundled invoice template for that reporting period is used automatically
 - users then download the finished workbook from the results page
 
 They do not need Python installed on their computer.
@@ -194,7 +216,7 @@ Typical setup:
 ### Notes For Hosting
 
 - Railway storage is not permanent, so users should download files right away.
-- The app includes a bundled default template for normal use.
+- The app includes both bundled templates, so past and current months both work after a fresh deploy.
 - The app can track anonymous aggregate counts such as visits and invoice generations without storing physician names, MSP numbers, or schedule details.
 - If you want login protection later, that can be added as a separate improvement.
 
@@ -202,7 +224,7 @@ Typical setup:
 
 - `hospitalist_invoice_generator.py`: the main app
 - `Start Hospitalist Invoice App.bat`: the easiest way to launch it
-- `templates/`: bundled invoice template files used by default
+- `templates/`: bundled invoice template files, one per rate period
 - `requirements.txt`: Python dependencies for deployment
 - `Procfile`: tells Railway how to start the web app
 - `outputs`: where finished invoice files are saved
