@@ -106,6 +106,24 @@ The app uses these rules:
 - clinical admin is `Off-Site` only when it follows a `VIRTUAL` shift
 - clinical admin is `On-Site` for the other supported shift types
 
+## Split Shifts
+
+Some shifts are shared between two people. The schedule writes them in one cell,
+either with a slash or with one name per line, such as `Beegan/Gu`.
+
+A shared shift is not a full shift, so the app does not bill it as one:
+
+- if a time is written beside your name, such as `Gu 1200-1700` or
+  `Chang (0700-1200)`, that time is used
+- if no time is written, the row is still created, but its start and end are left
+  blank and the row is highlighted in the workbook for you to fill in
+
+Times can be written as `0700-1200`, `07:00-12:00`, `7am-12pm` or `7-12pm`.
+
+When a row is left blank, the results page lists the date and shift so you know
+exactly what to look up, and any clinical admin that follows that shift is left
+blank and highlighted too.
+
 ## If Double-Clicking Works
 
 If the app starts and the browser page opens, you do not need to worry about Python or installing anything else.

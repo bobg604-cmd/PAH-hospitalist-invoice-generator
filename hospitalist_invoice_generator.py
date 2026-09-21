@@ -30,12 +30,14 @@ OPENPYXL_IMPORT_ERROR: ModuleNotFoundError | None = None
 
 try:
     from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill
     from openpyxl.workbook.properties import CalcProperties
 except ModuleNotFoundError as exc:
     if exc.name != "openpyxl":
         raise
     OPENPYXL_IMPORT_ERROR = exc
     load_workbook = None
+    PatternFill = None
     CalcProperties = None
 
 
@@ -66,6 +68,10 @@ AUTO_TEMPLATE_CHOICE = "__auto__"
 START_ROW = 18
 END_ROW = 217
 ADMIN_MINUTES = 15
+# Rows whose hours the schedule does not state are written blank and shaded, so
+# the physician can see at a glance which times still need typing in.
+MANUAL_TIME_ROW_FILL = "FFF2CC"
+MANUAL_TIME_CELL_FILL = "FFD966"
 ON_CALL_DAY_SHIFT_START = time(6, 30)
 ON_CALL_DAY_SHIFT_END = time(17, 30)
 DEFAULT_SHIFT_HOURS: dict[str, tuple[time, time]] = {
@@ -106,6 +112,15 @@ MONTH_NAME_TO_NUMBER["sept"] = 9
 MONTH_HEADING_PATTERN = re.compile(r"^(?P<month>[A-Za-z]{3,9})\.?[\s\-/,]+(?P<year>\d{4}|\d{2})$")
 ISO_DATE_PATTERN = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 TEAM_HEADER_PATTERN = re.compile(r"^team\s*(\d+)$", re.IGNORECASE)
+# One end of a time range: "0700", "07:00", "7:30am", "5pm" or a bare "7".
+CLOCK_TOKEN_PATTERN = r"\d{1,2}\s*:\s*\d{2}\s*[ap]\.?m\.?|\d{1,2}\s*[ap]\.?m\.?|\d{1,2}\s*:\s*\d{2}|\d{3,4}|\d{1,2}"
+TIME_RANGE_PATTERN = re.compile(
+    rf"(?<![\w:])(?P<start>{CLOCK_TOKEN_PATTERN})\s*(?:-|\u2013|\u2014|to)\s*(?P<end>{CLOCK_TOKEN_PATTERN})(?![\w:])",
+    re.IGNORECASE,
+)
+# Schedule cells separate the people sharing a shift with a slash, a semicolon
+# or a line break.
+SEGMENT_SPLIT_PATTERN = re.compile(r"[/;\r\n]+")
 SPECIAL_HEADER_KEYS = ("admit", "virtual", "evening", "overnight")
 HEADER_SEARCH_ROWS = 40
 ADMIN_TYPE_LABELS = {
@@ -172,6 +187,12 @@ class ShiftEntry:
     source: str = ""
     admin_categories: tuple[str, ...] = ()
     display_order: int = 0
+    # True when the schedule shared this shift between people without saying who
+    # worked which hours. start_time and end_time then hold the usual hours for
+    # that shift type, kept only so overlap checks and sorting still work, and
+    # the invoice row is written blank and highlighted instead.
+    needs_manual_time: bool = False
+    source_cell: str = ""
 
 
 @dataclass
@@ -207,6 +228,7 @@ class GenerationResult:
     source_tab: str | None = None
     other_source_tabs: list[str] = field(default_factory=list)
     adjustment_messages: list[str] = field(default_factory=list)
+    manual_time_messages: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -652,21 +674,72 @@ def parse_month_heading(cell_value: str) -> tuple[int, int] | None:
     return year, month
 
 
+def parse_clock_token(token: str) -> tuple[int, int, str | None, bool] | None:
+    """Read one end of a time range, such as "0700", "7:30", "7" or "5pm".
+
+    Returns the hour, the minute, the am/pm half if one was written, and whether
+    the token spelled its minutes out. A token that spelled its minutes out is a
+    real clock reading even without am/pm, which is how "0700-1200" is told
+    apart from a stray "1-2".
+    """
+    cleaned = re.sub(r"[\s.]", "", token).lower()
+    meridiem: str | None = None
+    if cleaned.endswith(("am", "pm")):
+        meridiem = cleaned[-2:]
+        cleaned = cleaned[:-2]
+    if ":" in cleaned:
+        hour_text, _, minute_text = cleaned.partition(":")
+        minutes_written = True
+    elif len(cleaned) in (3, 4):
+        hour_text, minute_text = cleaned[:-2], cleaned[-2:]
+        minutes_written = True
+    else:
+        hour_text, minute_text, minutes_written = cleaned, "0", False
+    if not hour_text.isdigit() or not minute_text.isdigit():
+        return None
+    hour, minute = int(hour_text), int(minute_text)
+    if minute > 59:
+        return None
+    if meridiem and not 1 <= hour <= 12:
+        return None
+    if not meridiem and hour > 24:
+        return None
+    return hour, minute, meridiem, minutes_written
+
+
 def parse_time_expression(part: str) -> tuple[time, time] | None:
-    match = re.search(
-        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|to)\s*"
-        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
-        part,
-        re.IGNORECASE,
-    )
+    match = TIME_RANGE_PATTERN.search(part)
     if not match:
         return None
-    sh, sm, sampm, eh, em, eampm = match.groups()
-    sampm = (sampm or eampm or "").lower()
-    eampm = (eampm or sampm or "").lower()
-    if not sampm or not eampm:
+    start = parse_clock_token(match.group("start"))
+    end = parse_clock_token(match.group("end"))
+    if not start or not end:
         return None
-    return to_clock_time(int(sh), int(sm or 0), sampm), to_clock_time(int(eh), int(em or 0), eampm)
+    start_hour, start_minute, start_meridiem, start_written = start
+    end_hour, end_minute, end_meridiem, end_written = end
+    if not any((start_meridiem, end_meridiem, start_written, end_written)):
+        # Two bare numbers, such as "1-2", are not a time range.
+        return None
+    if not start_meridiem and end_meridiem and not is_unambiguous_24_hour(start_hour, start_written):
+        # "7-5pm" and "11-2pm" start in the morning; "12-6pm" starts at noon.
+        start_meridiem = "am" if start_hour > end_hour and start_hour != 12 else end_meridiem
+    if not end_meridiem and start_meridiem and not is_unambiguous_24_hour(end_hour, end_written):
+        end_meridiem = start_meridiem
+    return (
+        resolve_clock_time(start_hour, start_minute, start_meridiem),
+        resolve_clock_time(end_hour, end_minute, end_meridiem),
+    )
+
+
+def is_unambiguous_24_hour(hour: int, minutes_written: bool) -> bool:
+    """True when a token can only be a 24-hour reading, such as "1700" or "0000"."""
+    return minutes_written and (hour > 12 or hour == 0)
+
+
+def resolve_clock_time(hour: int, minute: int, meridiem: str | None) -> time:
+    if meridiem:
+        return to_clock_time(hour, minute, meridiem)
+    return time(0 if hour == 24 else hour, minute)
 
 
 def to_clock_time(hour: int, minute: int, ampm: str) -> time:
@@ -676,28 +749,72 @@ def to_clock_time(hour: int, minute: int, ampm: str) -> time:
     return time(hour, minute)
 
 
-def extract_evening_interval(
+def schedule_segments(cell_value: str) -> list[str]:
+    """Split one schedule cell into a piece per person.
+
+    Split shifts are written as "Beegan/Gu" or with one name per line, and the
+    hours, when they are given at all, sit beside or under the name. A piece
+    holding only a time belongs to the name above it, so it is folded back in.
+    """
+    segments: list[str] = []
+    for raw in SEGMENT_SPLIT_PATTERN.split(cell_value):
+        piece = raw.strip()
+        if not piece:
+            continue
+        if segments and not segment_names_a_person(piece):
+            segments[-1] = f"{segments[-1]} {piece}"
+        else:
+            segments.append(piece)
+    return segments
+
+
+def segment_names_a_person(segment: str) -> bool:
+    remainder = TIME_RANGE_PATTERN.sub(" ", segment)
+    remainder = re.sub(r"[^A-Za-z]+", " ", remainder)
+    return any(len(word) >= 2 for word in remainder.split())
+
+
+def cell_splits_between_people(cell_value: str) -> bool:
+    return sum(1 for segment in schedule_segments(cell_value) if segment_names_a_person(segment)) > 1
+
+
+def describe_schedule_cell(cell_value: str) -> str:
+    return " / ".join(schedule_segments(cell_value))
+
+
+@dataclass(frozen=True)
+class CellInterval:
+    start: time
+    end: time
+    needs_manual_time: bool
+
+
+def resolve_cell_interval(
     cell_value: str,
     aliases: list[str],
-    default: tuple[time, time] | None = None,
-) -> tuple[time, time] | None:
-    if not any(alias_in_text(alias, cell_value) for alias in aliases):
-        return None
-    for segment in re.split(r"/|;", cell_value):
-        if any(alias_in_text(alias, segment) for alias in aliases):
-            parsed = parse_time_expression(segment)
-            if parsed:
-                return parsed
+    default_interval: tuple[time, time],
+) -> CellInterval:
+    """Work out the hours one schedule cell bills for.
+
+    A time written beside the name always wins. Failing that, a cell shared
+    between people is a split shift of unknown length, so the hours are left for
+    the physician to fill in rather than guessed at. A cell naming one person
+    keeps the usual hours for that shift type.
+    """
+    for segment in matching_schedule_segments(cell_value, aliases):
+        parsed = parse_time_expression(segment)
+        if parsed:
+            return CellInterval(parsed[0], parsed[1], False)
+    if cell_splits_between_people(cell_value):
+        return CellInterval(default_interval[0], default_interval[1], True)
     parsed = parse_time_expression(cell_value)
     if parsed:
-        return parsed
-    if default is not None:
-        return default
-    return EVENING_SHIFT.default_start, EVENING_SHIFT.default_end
+        return CellInterval(parsed[0], parsed[1], False)
+    return CellInterval(default_interval[0], default_interval[1], False)
 
 
 def matching_schedule_segments(cell_value: str, aliases: list[str]) -> list[str]:
-    segments = [segment.strip() for segment in re.split(r"/|;", cell_value) if segment.strip()]
+    segments = schedule_segments(cell_value)
     matches = [segment for segment in segments if any(alias_in_text(alias, segment) for alias in aliases)]
     if matches:
         return matches
@@ -889,8 +1006,8 @@ def parse_master_schedule(
         evening_text = row[plan.evening.column_index].strip() if plan.evening else ""
         overnight_text = row[plan.overnight.column_index].strip() if plan.overnight else ""
         evening_interval = (
-            extract_evening_interval(evening_text, aliases, default=evening_default)
-            if evening_text
+            resolve_cell_interval(evening_text, aliases, evening_default)
+            if row_matches_aliases(evening_text, aliases)
             else None
         )
         overnight_match = row_matches_aliases(overnight_text, aliases)
@@ -901,21 +1018,21 @@ def parse_master_schedule(
             if not row_matches_aliases(cell_value, aliases):
                 continue
             if definition in plan.teams:
-                start_time, end_time = day_start, day_end
+                default_interval = (day_start, day_end)
                 if is_on_call_day_shift(cell_value, aliases):
-                    start_time, end_time = day_call_start, day_call_end
+                    default_interval = (day_call_start, day_call_end)
             elif definition is plan.admit:
-                start_time, end_time = admit_start, admit_end
+                default_interval = (admit_start, admit_end)
             elif definition is plan.virtual:
-                start_time, end_time = virtual_start, virtual_end
+                default_interval = (virtual_start, virtual_end)
             else:
-                start_time = definition.default_start
-                end_time = definition.default_end
+                default_interval = (definition.default_start, definition.default_end)
+            interval = resolve_cell_interval(cell_value, aliases, default_interval)
             entries.append(
                 ShiftEntry(
                     service_date=service_date,
-                    start_time=start_time,
-                    end_time=end_time,
+                    start_time=interval.start,
+                    end_time=interval.end,
                     site_mode=definition.site_mode,
                     schedule_mode=definition.schedule_mode,
                     service_category=definition.service_category,
@@ -923,6 +1040,8 @@ def parse_master_schedule(
                     source=definition.label,
                     admin_categories=definition.admin_categories,
                     display_order=order_counter,
+                    needs_manual_time=interval.needs_manual_time,
+                    source_cell=describe_schedule_cell(cell_value),
                 )
             )
             order_counter += 1
@@ -931,8 +1050,8 @@ def parse_master_schedule(
             entries.append(
                 ShiftEntry(
                     service_date=service_date,
-                    start_time=evening_interval[0],
-                    end_time=evening_interval[1],
+                    start_time=evening_interval.start,
+                    end_time=evening_interval.end,
                     site_mode=plan.evening.site_mode,
                     schedule_mode=plan.evening.schedule_mode,
                     service_category=plan.evening.service_category,
@@ -940,16 +1059,25 @@ def parse_master_schedule(
                     source="Evening",
                     admin_categories=plan.evening.admin_categories,
                     display_order=order_counter,
+                    needs_manual_time=evening_interval.needs_manual_time,
+                    source_cell=describe_schedule_cell(evening_text),
                 )
             )
             order_counter += 1
 
         if overnight_match and plan.overnight:
+            interval = resolve_cell_interval(overnight_text, aliases, (overnight_start, overnight_end))
+            # An overnight normally bills 00:00-07:00 on the morning after the
+            # night it is scheduled for. A split overnight written as 23:00-03:00
+            # starts on the scheduled evening instead, so it stays on that date.
+            entry_date = service_date + timedelta(days=1)
+            if not interval.needs_manual_time and interval.start >= time(12, 0):
+                entry_date = service_date
             entries.append(
                 ShiftEntry(
-                    service_date=service_date + timedelta(days=1),
-                    start_time=overnight_start,
-                    end_time=overnight_end,
+                    service_date=entry_date,
+                    start_time=interval.start,
+                    end_time=interval.end,
                     site_mode=plan.overnight.site_mode,
                     schedule_mode=plan.overnight.schedule_mode,
                     service_category=plan.overnight.service_category,
@@ -957,6 +1085,8 @@ def parse_master_schedule(
                     source="Overnight",
                     admin_categories=plan.overnight.admin_categories,
                     display_order=order_counter,
+                    needs_manual_time=interval.needs_manual_time,
+                    source_cell=describe_schedule_cell(overnight_text),
                 )
             )
             order_counter += 1
@@ -988,18 +1118,16 @@ def resolve_overnight_day_overlap(shifts: list[ShiftEntry]) -> list[str]:
     """
     overnight_ends: dict[date, time] = {}
     for shift in shifts:
-        if "overnight" not in shift.admin_categories:
+        if "overnight" not in shift.admin_categories or shift.needs_manual_time:
             continue
         _, end_dt = actual_interval(shift)
-        if end_dt.date() != shift.service_date:
-            continue
-        previous = overnight_ends.get(shift.service_date)
-        if previous is None or shift.end_time > previous:
-            overnight_ends[shift.service_date] = shift.end_time
+        previous = overnight_ends.get(end_dt.date())
+        if previous is None or end_dt.time() > previous:
+            overnight_ends[end_dt.date()] = end_dt.time()
 
     messages: list[str] = []
     for shift in shifts:
-        if "scheduled" not in shift.admin_categories:
+        if "scheduled" not in shift.admin_categories or shift.needs_manual_time:
             continue
         overnight_end = overnight_ends.get(shift.service_date)
         if overnight_end is None:
@@ -1050,7 +1178,10 @@ def build_invoice_rows(
         ]
         admin_occupied = occupied_without_self + [actual_interval(admin_row) for admin_row in added_admin_rows]
 
-        if overlaps_interval(admin_start, admin_end, admin_occupied):
+        # A shift with no hours on the schedule has no known end, so there is
+        # nothing to test the admin window against. The row is still created, and
+        # is left blank and highlighted alongside the shift it follows.
+        if not shift.needs_manual_time and overlaps_interval(admin_start, admin_end, admin_occupied):
             skipped_messages.append(
                 f"Skipped clinical admin after {shift.service_date.isoformat()} {shift.source} because it overlaps another billed interval."
             )
@@ -1065,6 +1196,8 @@ def build_invoice_rows(
             service_category="Clinical Admin",
             note=admin_note,
             source=f"Clinical Admin after {shift.source}",
+            needs_manual_time=shift.needs_manual_time,
+            source_cell=shift.source_cell,
         )
         final_rows.append(admin_row)
         added_admin_rows.append(admin_row)
@@ -1084,12 +1217,45 @@ def write_invoice_rows(invoice_sheet, rows: list[ShiftEntry]) -> None:
     for offset, entry in enumerate(rows):
         row = START_ROW + offset
         invoice_sheet.cell(row=row, column=1, value=entry.service_date)
-        invoice_sheet.cell(row=row, column=2, value=entry.start_time)
-        invoice_sheet.cell(row=row, column=3, value=entry.end_time)
+        invoice_sheet.cell(row=row, column=2, value=None if entry.needs_manual_time else entry.start_time)
+        invoice_sheet.cell(row=row, column=3, value=None if entry.needs_manual_time else entry.end_time)
         invoice_sheet.cell(row=row, column=4, value=entry.site_mode)
         invoice_sheet.cell(row=row, column=5, value=entry.schedule_mode)
         invoice_sheet.cell(row=row, column=6, value=entry.service_category)
         invoice_sheet.cell(row=row, column=7, value=entry.note)
+        if entry.needs_manual_time:
+            highlight_manual_time_row(invoice_sheet, row)
+
+
+def highlight_manual_time_row(invoice_sheet, row: int) -> None:
+    """Shade a row the physician still has to put start and end times into."""
+    if PatternFill is None:
+        return
+    for column in range(1, 8):
+        color = MANUAL_TIME_CELL_FILL if column in (2, 3) else MANUAL_TIME_ROW_FILL
+        invoice_sheet.cell(row=row, column=column).fill = PatternFill(
+            fill_type="solid", start_color=color, end_color=color
+        )
+
+
+def manual_time_messages_for(rows: list[ShiftEntry]) -> list[str]:
+    messages: list[str] = []
+    for entry in rows:
+        if not entry.needs_manual_time:
+            continue
+        if entry.service_category == "Clinical Admin":
+            messages.append(
+                f"{entry.service_date.isoformat()} {entry.source} follows a split shift with no "
+                "hours on the schedule, so its row is blank and highlighted as well."
+            )
+            continue
+        shared_with = f" ({entry.source_cell})" if entry.source_cell else ""
+        messages.append(
+            f"{entry.service_date.isoformat()} {entry.source} is a split shift{shared_with} and the "
+            "schedule does not say which hours are yours, so that row is blank and highlighted in "
+            "the workbook for you to fill in."
+        )
+    return messages
 
 
 def configure_invoice_header(
@@ -1412,10 +1578,19 @@ def print_generation_summary(result: GenerationResult) -> None:
     print(f"Matched {len(result.invoice_rows)} invoice rows.")
     for entry in result.invoice_rows:
         note_suffix = f" | note: {entry.note}" if entry.note else ""
+        hours = (
+            "enter time"
+            if entry.needs_manual_time
+            else f"{entry.start_time.strftime('%H:%M')}-{entry.end_time.strftime('%H:%M')}"
+        )
         print(
-            f"  {entry.service_date.isoformat()} | {entry.start_time.strftime('%H:%M')}-{entry.end_time.strftime('%H:%M')} | "
+            f"  {entry.service_date.isoformat()} | {hours} | "
             f"{entry.site_mode} | {entry.schedule_mode} | {entry.service_category} | {entry.source}{note_suffix}"
         )
+    if result.manual_time_messages:
+        print("\nSplit shifts that need your times:")
+        for message in result.manual_time_messages:
+            print(f"  - {message}")
     if result.adjustment_messages:
         print("\nAdjusted to avoid overlapping hours:")
         for message in result.adjustment_messages:
@@ -1512,6 +1687,7 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
         options.clinical_admin_types,
         options.clinical_admin_note,
     )
+    manual_time_messages = manual_time_messages_for(invoice_rows)
 
     result = GenerationResult(
         options=options,
@@ -1523,6 +1699,7 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
         source_tab=source_tab,
         other_source_tabs=other_source_tabs,
         adjustment_messages=adjustment_messages,
+        manual_time_messages=manual_time_messages,
     )
 
     if options.dry_run:
@@ -1655,11 +1832,14 @@ def render_form(
     if result:
         rows = []
         for entry in result.invoice_rows:
+            row_class = ' class="needs-time"' if entry.needs_manual_time else ""
+            start_cell = "Enter time" if entry.needs_manual_time else entry.start_time.strftime("%H:%M")
+            end_cell = "Enter time" if entry.needs_manual_time else entry.end_time.strftime("%H:%M")
             rows.append(
-                "<tr>"
+                f"<tr{row_class}>"
                 f"<td>{entry.service_date.isoformat()}</td>"
-                f"<td>{entry.start_time.strftime('%H:%M')}</td>"
-                f"<td>{entry.end_time.strftime('%H:%M')}</td>"
+                f"<td>{start_cell}</td>"
+                f"<td>{end_cell}</td>"
                 f"<td>{html.escape(entry.site_mode)}</td>"
                 f"<td>{html.escape(entry.schedule_mode)}</td>"
                 f"<td>{html.escape(entry.service_category)}</td>"
@@ -1667,6 +1847,11 @@ def render_form(
                 "</tr>"
             )
         skipped_html = ""
+        if result.manual_time_messages:
+            manual_items = "".join(
+                f"<li>{html.escape(message)}</li>" for message in result.manual_time_messages
+            )
+            skipped_html += f"<h3>Split Shifts That Need Your Times</h3><ul>{manual_items}</ul>"
         if result.adjustment_messages:
             adjustment_items = "".join(f"<li>{html.escape(message)}</li>" for message in result.adjustment_messages)
             skipped_html += f"<h3>Adjusted To Avoid Overlapping Hours</h3><ul>{adjustment_items}</ul>"
@@ -1690,6 +1875,15 @@ def render_form(
                 "<p>That month was not on the selected tab, so it was read from the archived tab "
                 f"<strong>{html.escape(result.source_tab)}</strong>.{also}</p>"
             )
+        manual_time_banner = ""
+        if result.manual_time_messages:
+            manual_time_banner = (
+                '<div class="alert warning"><strong>'
+                f"{len(result.manual_time_messages)} highlighted row(s) still need start and end times."
+                "</strong> These are split shifts the schedule did not put hours against. "
+                "Open the workbook, fill in the shaded cells, and the invoice totals will update."
+                "</div>"
+            )
         result_html = (
             '<section class="panel results">'
             "<h2>Generated Invoice</h2>"
@@ -1697,6 +1891,7 @@ def render_form(
             f"{source_tab_html}"
             f"<p>Built from <strong>{html.escape(result.options.template.name)}</strong>.</p>"
             f"<p>Matched {len(result.matched_shifts)} source shifts and added {len(result.added_admin_rows)} clinical admin rows.</p>"
+            f"{manual_time_banner}"
             '<div class="table-wrap"><table><thead><tr>'
             "<th>Date</th><th>Start</th><th>End</th><th>Mode</th><th>Schedule</th><th>Category</th><th>Notes</th>"
             "</tr></thead><tbody>"
@@ -2143,6 +2338,20 @@ def render_form(
       border: 1px solid #add9ce;
       background: var(--accent-soft);
       color: var(--accent);
+    }}
+    .alert.warning {{
+      border: 1px solid #e3c069;
+      background: #fdf4dd;
+      color: #7a5600;
+    }}
+    tr.needs-time td {{
+      background: #fdf4dd;
+    }}
+    tr.needs-time td:nth-child(2),
+    tr.needs-time td:nth-child(3) {{
+      background: #f8e2a8;
+      font-weight: 700;
+      color: #7a5600;
     }}
     .table-wrap {{
       overflow: auto;
