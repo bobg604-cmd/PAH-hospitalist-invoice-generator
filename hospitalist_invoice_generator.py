@@ -81,7 +81,7 @@ DEFAULT_SHIFT_HOURS: dict[str, tuple[time, time]] = {
     "evening": (time(17, 0), time(0, 0)),
     "overnight": (time(0, 0), time(7, 0)),
     "admit": (time(11, 0), time(17, 0)),
-    "virtual": (time(18, 0), time(21, 0)),
+    "virtual": (time(17, 0), time(21, 0)),
 }
 SHIFT_HOURS_LABELS: dict[str, str] = {
     "day": "Day shift",
@@ -293,7 +293,7 @@ ADMIT_SHIFT = ShiftDefinition(
 VIRTUAL_SHIFT = ShiftDefinition(
     12,
     "VIRTUAL",
-    time(18, 0),
+    time(17, 0),
     time(21, 0),
     "Off-Site",
     "Non-Scheduled",
