@@ -79,7 +79,7 @@ DEFAULT_SHIFT_HOURS: dict[str, tuple[time, time]] = {
     "day_call": (time(6, 30), time(17, 30)),
     "evening": (time(17, 0), time(0, 0)),
     "overnight": (time(0, 0), time(7, 0)),
-    "admit": (time(12, 0), time(18, 0)),
+    "admit": (time(11, 0), time(17, 0)),
     "virtual": (time(18, 0), time(21, 0)),
 }
 SHIFT_HOURS_LABELS: dict[str, str] = {
@@ -130,6 +130,18 @@ ADMIN_TYPE_LABELS = {
     "admit": "ADMIT shifts",
     "virtual": "VIRTUAL shifts",
 }
+# Optional unscheduled clinical admin beyond the 15-minute add-on. Evening and
+# night handovers sit right against the shift, before it starts and after it
+# ends, and are left off when the physician is already on shift at that time.
+HANDOVER_MINUTE_CHOICES = (0, 15, 30)
+# A stretch of team day shifts is handed over at a fixed evening time: the day
+# before the stretch starts, and on its last day.
+TEAM_HANDOVER_START = time(18, 0)
+TEAM_HANDOVER_END = time(19, 0)
+# The on-call day doctor prints the day lists and billing sheets before 06:30.
+DAY_CALL_PREP_START = time(6, 0)
+DAY_CALL_PREP_END = time(6, 30)
+DAY_CALL_PREP_NOTE = "printing day lists and billing sheets"
 USAGE_COUNTER_KEYS = (
     "page_views",
     "invoice_attempts",
@@ -193,6 +205,22 @@ class ShiftEntry:
     # the invoice row is written blank and highlighted instead.
     needs_manual_time: bool = False
     source_cell: str = ""
+    # A team day shift marked *C, the on-call day doctor for that date.
+    on_call: bool = False
+    # False for shifts read from the day either side of the reporting period.
+    # They are not billed on this invoice, but they decide whether a handover
+    # is needed and whether billed time would overlap the next invoice.
+    in_period: bool = True
+
+
+@dataclass(frozen=True)
+class ClinicalAdminExtras:
+    """Optional unscheduled clinical admin added alongside the shifts."""
+
+    evening_handover_minutes: int = 0
+    overnight_handover_minutes: int = 0
+    team_stretch_handover: bool = False
+    day_call_prep: bool = False
 
 
 @dataclass
@@ -214,6 +242,7 @@ class GenerationOptions:
     submission_date: date
     output: Path | None = None
     dry_run: bool = False
+    admin_extras: ClinicalAdminExtras = field(default_factory=ClinicalAdminExtras)
 
 
 @dataclass
@@ -253,8 +282,8 @@ TEAM_SHIFTS = [
 ADMIT_SHIFT = ShiftDefinition(
     11,
     "ADMIT",
-    time(12, 0),
-    time(18, 0),
+    time(11, 0),
+    time(17, 0),
     "On-Site",
     "Non-Scheduled",
     "Patient Care",
@@ -419,6 +448,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--clinical-admin-note",
         default="doing billings",
         help="Optional note added to clinical admin rows.",
+    )
+    parser.add_argument(
+        "--evening-handover",
+        type=int,
+        choices=HANDOVER_MINUTE_CHOICES,
+        default=0,
+        help="Minutes of handover before and after each evening shift (0, 15 or 30).",
+    )
+    parser.add_argument(
+        "--night-handover",
+        type=int,
+        choices=HANDOVER_MINUTE_CHOICES,
+        default=0,
+        help="Minutes of handover before and after each night shift (0, 15 or 30).",
+    )
+    parser.add_argument(
+        "--team-stretch-handover",
+        action="store_true",
+        help="Add a 1-hour 18:00-19:00 handover the day before a stretch of team day shifts and on its last day.",
+    )
+    parser.add_argument(
+        "--day-call-prep",
+        action="store_true",
+        help="Add 06:00-06:30 before each on-call (*C) day shift for printing day lists and billing sheets.",
     )
     parser.add_argument("--submission-date", help="Submission date in YYYY-MM-DD format. Defaults to today.")
     parser.add_argument("--output", type=Path, help="Destination workbook path.")
@@ -830,12 +883,12 @@ def is_on_call_day_shift(cell_value: str, aliases: list[str]) -> bool:
     return False
 
 
-def date_in_requested_period(target: date, year: int, month: int, period: str) -> bool:
-    if target.year != year or target.month != month:
-        return False
+def period_bounds(year: int, month: int, period: str) -> tuple[date, date]:
+    """First and last schedule dates of one half-month reporting period."""
     if period == "first":
-        return 1 <= target.day <= 15
-    return target.day >= 16
+        return date(year, month, 1), date(year, month, 15)
+    next_month = date(year + (month == 12), month % 12 + 1, 1)
+    return date(year, month, 16), next_month - timedelta(days=1)
 
 
 def row_matches_aliases(row_value: str, aliases: list[str]) -> bool:
@@ -945,8 +998,8 @@ def search_all_tabs(
             continue
         search.tabs_with_month.append(title)
         search.tab_layouts[title] = plan.describe()
-        entries = parse_master_schedule(rows, aliases, year, month, period, shift_hours, plan=plan)
-        if entries:
+        entries = parse_master_schedule(rows, aliases, year, month, period, shift_hours, plan=plan, context_days=1)
+        if any(entry.in_period for entry in entries):
             ranked.append((0 if state == "visible" else 1, title, entries))
 
     ranked.sort(key=lambda item: item[0])
@@ -970,11 +1023,21 @@ def parse_master_schedule(
     period: str,
     shift_hours: dict[str, tuple[time, time]] | None = None,
     plan: SchedulePlan | None = None,
+    context_days: int = 0,
 ) -> list[ShiftEntry]:
+    """Read the physician's shifts for one reporting period.
+
+    With context_days, shifts from that many days either side of the period are
+    returned too, marked in_period=False, so handovers and overlaps can be
+    judged across the boundary with the neighbouring invoice.
+    """
     if shift_hours is None:
         shift_hours = load_shift_hours()
     if plan is None:
         plan = detect_schedule_plan(rows) or DEFAULT_SCHEDULE_PLAN
+    period_first, period_last = period_bounds(year, month, period)
+    window_first = period_first - timedelta(days=context_days)
+    window_last = period_last + timedelta(days=context_days)
     required_length = plan.required_row_length()
     day_start, day_end = shift_hours["day"]
     day_call_start, day_call_end = shift_hours["day_call"]
@@ -1000,8 +1063,9 @@ def parse_master_schedule(
             continue
 
         service_date = date(current_year_month[0], current_year_month[1], int(row[1]))
-        if not date_in_requested_period(service_date, year, month, period):
+        if not window_first <= service_date <= window_last:
             continue
+        in_period = period_first <= service_date <= period_last
 
         evening_text = row[plan.evening.column_index].strip() if plan.evening else ""
         overnight_text = row[plan.overnight.column_index].strip() if plan.overnight else ""
@@ -1017,9 +1081,10 @@ def parse_master_schedule(
             cell_value = row[definition.column_index].strip()
             if not row_matches_aliases(cell_value, aliases):
                 continue
+            on_call = definition in plan.teams and is_on_call_day_shift(cell_value, aliases)
             if definition in plan.teams:
                 default_interval = (day_start, day_end)
-                if is_on_call_day_shift(cell_value, aliases):
+                if on_call:
                     default_interval = (day_call_start, day_call_end)
             elif definition is plan.admit:
                 default_interval = (admit_start, admit_end)
@@ -1042,6 +1107,8 @@ def parse_master_schedule(
                     display_order=order_counter,
                     needs_manual_time=interval.needs_manual_time,
                     source_cell=describe_schedule_cell(cell_value),
+                    on_call=on_call,
+                    in_period=in_period,
                 )
             )
             order_counter += 1
@@ -1061,6 +1128,7 @@ def parse_master_schedule(
                     display_order=order_counter,
                     needs_manual_time=evening_interval.needs_manual_time,
                     source_cell=describe_schedule_cell(evening_text),
+                    in_period=in_period,
                 )
             )
             order_counter += 1
@@ -1087,6 +1155,7 @@ def parse_master_schedule(
                     display_order=order_counter,
                     needs_manual_time=interval.needs_manual_time,
                     source_cell=describe_schedule_cell(overnight_text),
+                    in_period=in_period,
                 )
             )
             order_counter += 1
@@ -1109,15 +1178,24 @@ def overlaps_interval(candidate_start: datetime, candidate_end: datetime, occupi
     return False
 
 
-def resolve_overnight_day_overlap(shifts: list[ShiftEntry]) -> list[str]:
+def resolve_overnight_day_overlap(
+    shifts: list[ShiftEntry],
+    context_shifts: list[ShiftEntry] | None = None,
+) -> list[str]:
     """Stop an on-call day shift from overlapping that morning's overnight shift.
 
     An overnight runs to 07:00 and an on-call day shift starts at 06:30, so
     working both bills 06:30-07:00 twice, which is not allowed. The day shift is
     moved to start when the overnight ends, giving 07:00-17:30.
+
+    Shifts from the days either side of the period are adjusted too, so the
+    overnight on the 15th is seen by the day shift on the 16th and the other
+    way round, but only shifts billed on this invoice are reported.
     """
+    context_shifts = context_shifts if context_shifts is not None else []
+    every_shift = list(shifts) + list(context_shifts)
     overnight_ends: dict[date, time] = {}
-    for shift in shifts:
+    for shift in every_shift:
         if "overnight" not in shift.admin_categories or shift.needs_manual_time:
             continue
         _, end_dt = actual_interval(shift)
@@ -1126,7 +1204,8 @@ def resolve_overnight_day_overlap(shifts: list[ShiftEntry]) -> list[str]:
             overnight_ends[end_dt.date()] = end_dt.time()
 
     messages: list[str] = []
-    for shift in shifts:
+    adjusted = False
+    for shift in every_shift:
         if "scheduled" not in shift.admin_categories or shift.needs_manual_time:
             continue
         overnight_end = overnight_ends.get(shift.service_date)
@@ -1136,14 +1215,18 @@ def resolve_overnight_day_overlap(shifts: list[ShiftEntry]) -> list[str]:
             continue
         original_start = shift.start_time
         shift.start_time = overnight_end
+        adjusted = True
+        if not shift.in_period:
+            continue
         messages.append(
             f"{shift.service_date.isoformat()} {shift.source} now starts at "
             f"{overnight_end.strftime('%H:%M')} instead of {original_start.strftime('%H:%M')} "
             "so it does not overlap the overnight shift."
         )
 
-    if messages:
-        shifts.sort(key=lambda item: (item.service_date, item.start_time, item.display_order))
+    if adjusted:
+        for group in (shifts, context_shifts):
+            group.sort(key=lambda item: (item.service_date, item.start_time, item.display_order))
     return messages
 
 
@@ -1153,55 +1236,213 @@ def clinical_admin_site_mode(shift: ShiftEntry) -> str:
     return "On-Site"
 
 
+def clinical_admin_row(
+    start_dt: datetime,
+    end_dt: datetime,
+    *,
+    site_mode: str,
+    note: str,
+    source: str,
+    needs_manual_time: bool = False,
+    source_cell: str = "",
+) -> ShiftEntry:
+    """A Non-Scheduled Clinical Admin row, dated by the day it starts."""
+    return ShiftEntry(
+        service_date=start_dt.date(),
+        start_time=start_dt.time(),
+        end_time=end_dt.time(),
+        site_mode=site_mode,
+        schedule_mode="Non-Scheduled",
+        service_category="Clinical Admin",
+        note=note,
+        source=source,
+        needs_manual_time=needs_manual_time,
+        source_cell=source_cell,
+    )
+
+
+def handover_minutes_for(shift: ShiftEntry, extras: ClinicalAdminExtras) -> tuple[int, str]:
+    if "evening" in shift.admin_categories:
+        return extras.evening_handover_minutes, "evening shift"
+    if "overnight" in shift.admin_categories:
+        return extras.overnight_handover_minutes, "night shift"
+    return 0, ""
+
+
+def team_day_stretches(shifts: Iterable[ShiftEntry]) -> list[tuple[date, date]]:
+    """Runs of consecutive dates on which the physician works a team day shift."""
+    team_dates = sorted({shift.service_date for shift in shifts if "scheduled" in shift.admin_categories})
+    stretches: list[tuple[date, date]] = []
+    for team_date in team_dates:
+        if stretches and team_date == stretches[-1][1] + timedelta(days=1):
+            stretches[-1] = (stretches[-1][0], team_date)
+        else:
+            stretches.append((team_date, team_date))
+    return stretches
+
+
+def describe_shift(shift: ShiftEntry) -> str:
+    return f"{shift.service_date.isoformat()} {shift.note or shift.source}"
+
+
+def format_window(start_dt: datetime, end_dt: datetime) -> str:
+    return f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
+
+
 def build_invoice_rows(
     shifts: list[ShiftEntry],
     enabled_admin_types: set[str],
     admin_note: str,
+    extras: ClinicalAdminExtras | None = None,
+    context_shifts: Iterable[ShiftEntry] = (),
+    billing_dates: tuple[date, date] | None = None,
 ) -> tuple[list[ShiftEntry], list[ShiftEntry], list[str]]:
-    final_rows: list[ShiftEntry] = []
+    """Lay out the invoice: the shifts plus any clinical admin they earn.
+
+    Clinical admin is never allowed to overlap time already billed, whether a
+    shift (including shifts from the days either side of the period, which go
+    on the neighbouring invoice) or another admin row. A handover that would
+    overlap is dropped, which is what leaves it off when the physician is
+    already on shift right before or after.
+
+    Handovers and prep belong to the invoice of the shift they surround. A team
+    stretch handover is not attached to a shift, so it goes on the invoice whose
+    period (billing_dates) contains its date, which bills it exactly once.
+    """
+    extras = extras or ClinicalAdminExtras()
+    context_shifts = list(context_shifts)
+    shift_intervals = [actual_interval(shift) for shift in list(shifts) + context_shifts]
     added_admin_rows: list[ShiftEntry] = []
     skipped_messages: list[str] = []
-    occupied_intervals = [actual_interval(shift) for shift in shifts]
+    timeline: list[tuple[datetime, int, ShiftEntry]] = []
+
+    def place(row: ShiftEntry) -> None:
+        timeline.append((actual_interval(row)[0], len(timeline), row))
+
+    def already_billed(start_dt: datetime, end_dt: datetime) -> bool:
+        occupied = shift_intervals + [actual_interval(row) for row in added_admin_rows]
+        return overlaps_interval(start_dt, end_dt, occupied)
+
+    def add_admin(start_dt: datetime, end_dt: datetime, **row_fields) -> None:
+        row = clinical_admin_row(start_dt, end_dt, **row_fields)
+        added_admin_rows.append(row)
+        place(row)
+
+    stretches = team_day_stretches(list(shifts) + context_shifts) if extras.team_stretch_handover else []
+    stretch_ending_on = {last_day: (first_day, last_day) for first_day, last_day in stretches}
+    team_handover_dates: set[date] = set()
+
+    def add_team_handover(handover_date: date, note: str, when: str, first_day: date, last_day: date) -> datetime | None:
+        """Add the 18:00-19:00 team handover, returning its end, or None if it is skipped."""
+        if handover_date in team_handover_dates:
+            return None
+        team_handover_dates.add(handover_date)
+        if billing_dates and not billing_dates[0] <= handover_date <= billing_dates[1]:
+            return None
+        stretch = f"{first_day.isoformat()} to {last_day.isoformat()}" if first_day != last_day else first_day.isoformat()
+        window = (
+            datetime.combine(handover_date, TEAM_HANDOVER_START),
+            datetime.combine(handover_date, TEAM_HANDOVER_END),
+        )
+        if already_billed(*window):
+            skipped_messages.append(
+                f"No team handover on {handover_date.isoformat()} ({format_window(*window)}, {when} "
+                f"your team days {stretch}), because you are already billing that time."
+            )
+            return None
+        add_admin(*window, site_mode="On-Site", note=note, source=f"Team handover, {when} team days {stretch}")
+        return window[1]
 
     for shift in shifts:
-        final_rows.append(shift)
+        place(shift)
+        shift_start, shift_end = actual_interval(shift)
+        admin_start = shift_end
+
+        minutes, label = handover_minutes_for(shift, extras)
+        if minutes:
+            length = timedelta(minutes=minutes)
+            for side, window in (
+                ("before", (shift_start - length, shift_start)),
+                ("after", (shift_end, shift_end + length)),
+            ):
+                if already_billed(*window):
+                    skipped_messages.append(
+                        f"No handover {side} the {describe_shift(shift)} shift ({format_window(*window)}), "
+                        "because you are already billing that time."
+                    )
+                    continue
+                add_admin(
+                    *window,
+                    site_mode=clinical_admin_site_mode(shift),
+                    note=f"Handover {side} {label}",
+                    source=f"Handover {side} {shift.source}",
+                    needs_manual_time=shift.needs_manual_time,
+                    source_cell=shift.source_cell,
+                )
+                if side == "after":
+                    # The 15-minute admin follows the handover, not the shift.
+                    admin_start = window[1]
+
+        if extras.day_call_prep and shift.on_call:
+            window = (
+                datetime.combine(shift.service_date, DAY_CALL_PREP_START),
+                datetime.combine(shift.service_date, DAY_CALL_PREP_END),
+            )
+            if already_billed(*window):
+                skipped_messages.append(
+                    f"No day call prep before the {describe_shift(shift)} shift ({format_window(*window)}), "
+                    "because you are already billing that time."
+                )
+            else:
+                add_admin(
+                    *window,
+                    site_mode=clinical_admin_site_mode(shift),
+                    note=DAY_CALL_PREP_NOTE,
+                    source=f"Day call prep before {shift.source}",
+                    needs_manual_time=shift.needs_manual_time,
+                    source_cell=shift.source_cell,
+                )
+
+        if "scheduled" in shift.admin_categories and shift.service_date in stretch_ending_on:
+            first_day, last_day = stretch_ending_on[shift.service_date]
+            handover_end = add_team_handover(
+                last_day, "Patient handover, end of team day stretch", "the last day of", first_day, last_day
+            )
+            if handover_end is not None:
+                # On the last team day, the 15-minute admin follows the handover.
+                admin_start = handover_end
+
         if not any(category in enabled_admin_types for category in shift.admin_categories):
             continue
 
-        _, shift_end = actual_interval(shift)
-        admin_start = shift_end
-        admin_end = shift_end + timedelta(minutes=ADMIN_MINUTES)
-        occupied_without_self = [
-            interval
-            for other_shift, interval in zip(shifts, occupied_intervals)
-            if other_shift is not shift
-        ]
-        admin_occupied = occupied_without_self + [actual_interval(admin_row) for admin_row in added_admin_rows]
-
+        admin_end = admin_start + timedelta(minutes=ADMIN_MINUTES)
         # A shift with no hours on the schedule has no known end, so there is
         # nothing to test the admin window against. The row is still created, and
         # is left blank and highlighted alongside the shift it follows.
-        if not shift.needs_manual_time and overlaps_interval(admin_start, admin_end, admin_occupied):
+        if not shift.needs_manual_time and already_billed(admin_start, admin_end):
             skipped_messages.append(
                 f"Skipped clinical admin after {shift.service_date.isoformat()} {shift.source} because it overlaps another billed interval."
             )
             continue
 
-        admin_row = ShiftEntry(
-            service_date=shift.service_date,
-            start_time=admin_start.time(),
-            end_time=admin_end.time(),
+        add_admin(
+            admin_start,
+            admin_end,
             site_mode=clinical_admin_site_mode(shift),
-            schedule_mode="Non-Scheduled",
-            service_category="Clinical Admin",
             note=admin_note,
             source=f"Clinical Admin after {shift.source}",
             needs_manual_time=shift.needs_manual_time,
             source_cell=shift.source_cell,
         )
-        final_rows.append(admin_row)
-        added_admin_rows.append(admin_row)
 
+    # The day before a stretch has no team shift of its own to hang off.
+    for first_day, last_day in stretches:
+        add_team_handover(
+            first_day - timedelta(days=1), "Handover before team day stretch", "the day before", first_day, last_day
+        )
+
+    timeline.sort(key=lambda item: (item[0], item[1]))
+    final_rows = [row for _, _, row in timeline]
     return final_rows, added_admin_rows, skipped_messages
 
 
@@ -1245,8 +1486,9 @@ def manual_time_messages_for(rows: list[ShiftEntry]) -> list[str]:
             continue
         if entry.service_category == "Clinical Admin":
             messages.append(
-                f"{entry.service_date.isoformat()} {entry.source} follows a split shift with no "
-                "hours on the schedule, so its row is blank and highlighted as well."
+                f"{entry.service_date.isoformat()} {entry.source} goes with a split shift with no "
+                "hours on the schedule, so its row is blank and highlighted as well. Fill it in, "
+                "or clear it if it does not apply."
             )
             continue
         shared_with = f" ({entry.source_cell})" if entry.source_cell else ""
@@ -1636,6 +1878,12 @@ def build_generation_options_from_args(args: argparse.Namespace) -> GenerationOp
         submission_date=parse_submission_date(args.submission_date),
         output=args.output,
         dry_run=args.dry_run,
+        admin_extras=ClinicalAdminExtras(
+            evening_handover_minutes=args.evening_handover,
+            overnight_handover_minutes=args.night_handover,
+            team_stretch_handover=args.team_stretch_handover,
+            day_call_prep=args.day_call_prep,
+        ),
     )
 
 
@@ -1654,17 +1902,20 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
 
     master_rows = fetch_master_rows(options.master_url)
     plan = detect_schedule_plan(master_rows) or DEFAULT_SCHEDULE_PLAN
-    matched_shifts = parse_master_schedule(
+    # One day either side of the period is read as well, so handovers and
+    # overlaps are judged against the neighbouring invoice's shifts.
+    parsed_shifts = parse_master_schedule(
         master_rows,
         aliases,
         options.year,
         options.month,
         options.period,
         plan=plan,
+        context_days=1,
     )
     source_tab: str | None = None
     other_source_tabs: list[str] = []
-    if not matched_shifts:
+    if not any(entry.in_period for entry in parsed_shifts):
         # The tab the URL points at only carries the current schedule, so older
         # months live on archive tabs elsewhere in the same workbook.
         search = search_all_tabs(
@@ -1675,17 +1926,22 @@ def generate_invoice(options: GenerationOptions) -> GenerationResult:
             options.period,
         )
         if search.matches:
-            source_tab, matched_shifts = search.matches[0]
+            source_tab, parsed_shifts = search.matches[0]
             other_source_tabs = [title for title, _ in search.matches[1:]]
         else:
             raise ValueError(no_shifts_message(options, aliases, master_rows, plan, search))
 
-    adjustment_messages = resolve_overnight_day_overlap(matched_shifts)
+    matched_shifts = [entry for entry in parsed_shifts if entry.in_period]
+    context_shifts = [entry for entry in parsed_shifts if not entry.in_period]
+    adjustment_messages = resolve_overnight_day_overlap(matched_shifts, context_shifts)
 
     invoice_rows, added_admin_rows, skipped_admin_messages = build_invoice_rows(
         matched_shifts,
         options.clinical_admin_types,
         options.clinical_admin_note,
+        extras=options.admin_extras,
+        context_shifts=context_shifts,
+        billing_dates=period_bounds(options.year, options.month, options.period),
     )
     manual_time_messages = manual_time_messages_for(invoice_rows)
 
@@ -1815,6 +2071,17 @@ def render_form(
 
     def checked(name: str) -> str:
         return " checked" if name in checked_admin else ""
+
+    def flag(name: str) -> str:
+        return " checked" if values.get(name) else ""
+
+    def handover_options(name: str) -> str:
+        selected = values.get(name, "0")
+        labels = {0: "None", 15: "15 min", 30: "30 min"}
+        return "".join(
+            f'<option value="{minutes}"{" selected" if str(minutes) == selected else ""}>{labels[minutes]}</option>'
+            for minutes in HANDOVER_MINUTE_CHOICES
+        )
 
     def alert_html(messages: list[str], title: str = "Please fix:") -> str:
         if not messages:
@@ -1989,7 +2256,22 @@ def render_form(
           </label>
         </div>
         <div class="section-title">Clinical Admin</div>
-        <p class="hint">Checking a box adds one extra 15-minute clinical admin billing entry after each shift of that type. If the 15-minute add-on would overlap another billed interval, it is skipped automatically.</p>
+        <p class="hint">Optional unscheduled clinical admin. A handover is left off automatically when you are already on shift right before or after it.</p>
+        <div class="two">
+          <label>Evening Shift Handover
+            <select name="evening_handover">{handover_options('evening_handover')}</select>
+            <span class="hint">Before and after the shift, e.g. 16:30&ndash;17:00 and 00:00&ndash;00:30.</span>
+          </label>
+          <label>Night Shift Handover
+            <select name="night_handover">{handover_options('night_handover')}</select>
+            <span class="hint">Before and after the shift, e.g. 23:30&ndash;00:00 and 07:00&ndash;07:30.</span>
+          </label>
+        </div>
+        <div class="checks single">
+          <label class="check"><input type="checkbox" name="team_stretch_handover" value="1"{flag('team_stretch_handover')}><span>Team day stretch handover<span class="hint">1 h, 18:00&ndash;19:00, the day before your team days start and on the last day</span></span></label>
+          <label class="check"><input type="checkbox" name="day_call_prep" value="1"{flag('day_call_prep')}><span>Day call prep<span class="hint">06:00&ndash;06:30 before each *C day: printing day lists and billing sheets</span></span></label>
+        </div>
+        <p class="hint">15-minute clinical admin: checking a box adds one 15-minute entry after each shift of that type, or after the handover when one follows the shift. If it would overlap another billed interval, it is skipped automatically.</p>
         <div class="checks">
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="scheduled"{checked('scheduled')}>Scheduled / Team</label>
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="evening"{checked('evening')}>Evening</label>
@@ -2293,6 +2575,14 @@ def render_form(
       margin: 0;
       transform: scale(1.15);
     }}
+    .checks.single {{
+      grid-template-columns: 1fr;
+    }}
+    .check .hint {{
+      display: block;
+      margin: 2px 0 0;
+      font-size: 0.84rem;
+    }}
     .actions {{
       display: flex;
       gap: 12px;
@@ -2543,6 +2833,12 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     month_raw = collect_form_value(data, "month", str(date.today().month))
     period = collect_form_value(data, "period", "first")
     admin_types = parse_admin_type_values(data.get("clinical_admin_type", []))
+    admin_extras = ClinicalAdminExtras(
+        evening_handover_minutes=parse_handover_minutes(collect_form_value(data, "evening_handover", "0")),
+        overnight_handover_minutes=parse_handover_minutes(collect_form_value(data, "night_handover", "0")),
+        team_stretch_handover=bool(collect_form_value(data, "team_stretch_handover")),
+        day_call_prep=bool(collect_form_value(data, "day_call_prep")),
+    )
 
     missing = []
     for label, value in [
@@ -2591,7 +2887,18 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
         clinical_admin_types=admin_types,
         clinical_admin_note=clinical_admin_note,
         submission_date=submission_date,
+        admin_extras=admin_extras,
     )
+
+
+def parse_handover_minutes(raw_value: str) -> int:
+    try:
+        minutes = int(raw_value or "0")
+    except ValueError as exc:
+        raise ValueError("Handover length must be 0, 15 or 30 minutes.") from exc
+    if minutes not in HANDOVER_MINUTE_CHOICES:
+        raise ValueError("Handover length must be 0, 15 or 30 minutes.")
+    return minutes
 
 
 def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
@@ -2610,6 +2917,10 @@ def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
         "clinical_admin_note": collect_form_value(data, "clinical_admin_note", "doing billings"),
         "master_url": collect_form_value(data, "master_url", DEFAULT_MASTER_URL),
         "clinical_admin_types": ",".join(data.get("clinical_admin_type", [])),
+        "evening_handover": collect_form_value(data, "evening_handover", "0"),
+        "night_handover": collect_form_value(data, "night_handover", "0"),
+        "team_stretch_handover": collect_form_value(data, "team_stretch_handover"),
+        "day_call_prep": collect_form_value(data, "day_call_prep"),
     }
     return values
 

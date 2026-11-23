@@ -37,6 +37,8 @@ The form will ask for:
 - site, such as `PAH`
 - the name used on the master schedule
 - the month and half of the month
+- whether to add handover time around evening and night shifts, team handovers
+  around a run of team days, and day call prep time
 - whether to add 15 minutes of clinical admin after certain shift types
 
 You can also add schedule aliases if your name appears in more than one way on the schedule.
@@ -100,11 +102,45 @@ that choice applies to every reporting period until you set the tab back to
 The app uses these rules:
 
 - regular day/team shifts are `07:00-17:00`
+- `ADMIT` shifts are billed as `11:00-17:00`
 - if a day-shift entry has `*C` after the name, such as `Grewal*C`, that day is billed as `06:30-17:30`
 - if you also worked the overnight into that same morning, the `*C` day shift starts when the overnight ends, so it is billed as `07:00-17:30` instead, because the same half hour cannot be billed twice
 - `VIRTUAL` shifts are billed as `17:00-21:00` and are `Off-Site`
 - clinical admin is `Off-Site` only when it follows a `VIRTUAL` shift
 - clinical admin is `On-Site` for the other supported shift types
+
+## Optional Clinical Admin
+
+The Clinical Admin section of the form has some optional extras. Each one is
+billed as `Non-Scheduled` `Clinical Admin`, and never overlaps time you are
+already billing.
+
+- **Evening shift handover** (15 or 30 minutes): before the shift, such as
+  `16:30-17:00`, and after it, such as `00:00-00:30`
+- **Night shift handover** (15 or 30 minutes): before the shift, such as
+  `23:30-00:00`, and after it, such as `07:00-07:30`
+- **Team day stretch handover**: one hour, `18:00-19:00`, on the day before you
+  start a run of team day shifts, and again on the last day of that run
+- **Day call prep**: `06:00-06:30` before each `*C` day shift, noted as
+  `printing day lists and billing sheets`
+
+A handover is left off when you are already on shift right before or after it.
+For example, an evening shift followed by your own overnight gets no handover
+at midnight, and a night shift followed by your own day shift gets no handover
+at 07:00. The results page lists every handover that was left off and why.
+
+When a handover follows a shift, the 15-minute clinical admin moves to after the
+handover, such as `00:30-00:45` after an evening shift, or `19:00-19:15` on the
+last day of a run of team days. Other team days keep it at `17:00-17:15`.
+
+The app also reads the day either side of the half-month you are invoicing. That
+is how it knows whether a run of team days carries on past the 15th or the end
+of the month, so each team handover is billed once, on the invoice for the date
+it happens. If the next or previous month is not on the same sheet tab, check
+handovers that fall on the first or last day of the period.
+
+Every clinical admin row is dated by the day it starts, so admin after an
+evening shift is dated the next morning.
 
 ## Split Shifts
 
@@ -188,7 +224,11 @@ python .\hospitalist_invoice_generator.py `
   --month 4 `
   --period first `
   --clinical-admin-type scheduled `
-  --clinical-admin-type virtual
+  --clinical-admin-type virtual `
+  --evening-handover 30 `
+  --night-handover 30 `
+  --team-stretch-handover `
+  --day-call-prep
 ```
 
 ## Hosting On Railway
