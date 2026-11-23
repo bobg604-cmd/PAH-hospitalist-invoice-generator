@@ -68,6 +68,7 @@ AUTO_TEMPLATE_CHOICE = "__auto__"
 START_ROW = 18
 END_ROW = 217
 ADMIN_MINUTES = 15
+DEFAULT_CLINICAL_ADMIN_NOTE = "filling invoice forms"
 # Rows whose hours the schedule does not state are written blank and shaded, so
 # the physician can see at a glance which times still need typing in.
 MANUAL_TIME_ROW_FILL = "FFF2CC"
@@ -446,7 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--clinical-admin-note",
-        default="doing billings",
+        default=DEFAULT_CLINICAL_ADMIN_NOTE,
         help="Optional note added to clinical admin rows.",
     )
     parser.add_argument(
@@ -2280,7 +2281,7 @@ def render_form(
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="virtual"{checked('virtual')}>VIRTUAL</label>
         </div>
         <label>Clinical Admin Note
-          <input name="clinical_admin_note" value="{field('clinical_admin_note', 'doing billings')}">
+          <input name="clinical_admin_note" value="{field('clinical_admin_note', DEFAULT_CLINICAL_ADMIN_NOTE)}">
         </label>
         <div class="section-title">Sources</div>
         <label>Master Schedule URL
@@ -2869,7 +2870,7 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
         raise ValueError("Template workbook not found.")
     master_url = collect_form_value(data, "master_url", DEFAULT_MASTER_URL)
     submission_date = parse_submission_date(collect_form_value(data, "submission_date", date.today().isoformat()))
-    clinical_admin_note = collect_form_value(data, "clinical_admin_note", "doing billings")
+    clinical_admin_note = collect_form_value(data, "clinical_admin_note", DEFAULT_CLINICAL_ADMIN_NOTE)
 
     return GenerationOptions(
         template=template_path,
@@ -2914,7 +2915,7 @@ def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
         "month": collect_form_value(data, "month", str(date.today().month)),
         "period": collect_form_value(data, "period", "first"),
         "submission_date": collect_form_value(data, "submission_date", date.today().isoformat()),
-        "clinical_admin_note": collect_form_value(data, "clinical_admin_note", "doing billings"),
+        "clinical_admin_note": collect_form_value(data, "clinical_admin_note", DEFAULT_CLINICAL_ADMIN_NOTE),
         "master_url": collect_form_value(data, "master_url", DEFAULT_MASTER_URL),
         "clinical_admin_types": ",".join(data.get("clinical_admin_type", [])),
         "evening_handover": collect_form_value(data, "evening_handover", "0"),
