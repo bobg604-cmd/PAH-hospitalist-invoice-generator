@@ -2843,7 +2843,7 @@ def render_form(
       <a class="tab-link{' active' if active_tab == 'advanced' else ''}" href="/?tab=advanced">Advanced Settings</a>
     </div>
     {main_content}
-    <div class="footer-note">Created by Dr Bobby Gu MD with Codex</div>
+    <div class="footer-note">Created by Dr Bobby Gu</div>
   </div>
 </body>
 </html>"""
