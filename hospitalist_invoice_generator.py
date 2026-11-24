@@ -135,6 +135,7 @@ ADMIN_TYPE_LABELS = {
 # handover sits right before the shift starts and the night handover right
 # after it ends; either is left off when the physician is already on shift then.
 HANDOVER_MINUTE_CHOICES = (0, 15, 30)
+DEFAULT_HANDOVER_MINUTES = 30
 # A stretch of team day shifts is handed over at a fixed evening time: the day
 # before the stretch starts, and on its last day.
 TEAM_HANDOVER_START = time(18, 0)
@@ -460,15 +461,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--evening-handover",
         type=int,
         choices=HANDOVER_MINUTE_CHOICES,
-        default=0,
-        help="Minutes of handover just before each evening shift starts (0, 15 or 30).",
+        default=DEFAULT_HANDOVER_MINUTES,
+        help=f"Minutes of handover just before each evening shift starts (0, 15 or 30; default {DEFAULT_HANDOVER_MINUTES}).",
     )
     parser.add_argument(
         "--night-handover",
         type=int,
         choices=HANDOVER_MINUTE_CHOICES,
-        default=0,
-        help="Minutes of handover just after each night shift ends (0, 15 or 30).",
+        default=DEFAULT_HANDOVER_MINUTES,
+        help=f"Minutes of handover just after each night shift ends (0, 15 or 30; default {DEFAULT_HANDOVER_MINUTES}).",
     )
     parser.add_argument(
         "--team-stretch-handover",
@@ -2114,7 +2115,7 @@ def render_form(
         return " checked" if values.get(name) else ""
 
     def handover_options(name: str) -> str:
-        selected = values.get(name, "0")
+        selected = values.get(name, str(DEFAULT_HANDOVER_MINUTES))
         labels = {0: "None", 15: "15 min", 30: "30 min"}
         return "".join(
             f'<option value="{minutes}"{" selected" if str(minutes) == selected else ""}>{labels[minutes]}</option>'
@@ -2872,8 +2873,8 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     period = collect_form_value(data, "period", "first")
     admin_types = parse_admin_type_values(data.get("clinical_admin_type", []))
     admin_extras = ClinicalAdminExtras(
-        evening_handover_minutes=parse_handover_minutes(collect_form_value(data, "evening_handover", "0")),
-        overnight_handover_minutes=parse_handover_minutes(collect_form_value(data, "night_handover", "0")),
+        evening_handover_minutes=parse_handover_minutes(collect_form_value(data, "evening_handover", str(DEFAULT_HANDOVER_MINUTES))),
+        overnight_handover_minutes=parse_handover_minutes(collect_form_value(data, "night_handover", str(DEFAULT_HANDOVER_MINUTES))),
         team_stretch_handover=bool(collect_form_value(data, "team_stretch_handover")),
         day_call_prep=bool(collect_form_value(data, "day_call_prep")),
     )
@@ -2955,8 +2956,8 @@ def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
         "clinical_admin_note": collect_form_value(data, "clinical_admin_note", DEFAULT_CLINICAL_ADMIN_NOTE),
         "master_url": collect_form_value(data, "master_url", DEFAULT_MASTER_URL),
         "clinical_admin_types": ",".join(data.get("clinical_admin_type", [])),
-        "evening_handover": collect_form_value(data, "evening_handover", "0"),
-        "night_handover": collect_form_value(data, "night_handover", "0"),
+        "evening_handover": collect_form_value(data, "evening_handover", str(DEFAULT_HANDOVER_MINUTES)),
+        "night_handover": collect_form_value(data, "night_handover", str(DEFAULT_HANDOVER_MINUTES)),
         "team_stretch_handover": collect_form_value(data, "team_stretch_handover"),
         "day_call_prep": collect_form_value(data, "day_call_prep"),
     }

@@ -115,10 +115,10 @@ The Clinical Admin section of the form has some optional extras. Each one is
 billed as `Non-Scheduled` `Clinical Admin`, and never overlaps time you are
 already billing.
 
-- **Evening shift handover** (15 or 30 minutes): one entry just before the
-  shift, such as `16:30-17:00`
-- **Night shift handover** (15 or 30 minutes): one entry just after the
-  shift, such as `07:00-07:30`
+- **Evening shift handover** (30 minutes unless you pick 15 or None): one
+  entry just before the shift, such as `16:30-17:00`
+- **Night shift handover** (30 minutes unless you pick 15 or None): one
+  entry just after the shift, such as `07:00-07:30`
 - **Team day stretch handover**: one hour, `18:00-19:00`, on the day before you
   start a run of team day shifts, and again on the last day of that run. If you
   are on an evening shift at that time it moves to `15:30-16:30`, leaving time
