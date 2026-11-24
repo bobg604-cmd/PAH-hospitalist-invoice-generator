@@ -69,6 +69,10 @@ START_ROW = 18
 END_ROW = 217
 ADMIN_MINUTES = 30
 DEFAULT_CLINICAL_ADMIN_NOTE = "filling invoices and handover to on call physicians"
+# After a night shift handover, which has its own row, the clinical admin is a
+# shorter spell of filling invoices.
+ADMIN_AFTER_HANDOVER_MINUTES = 15
+ADMIN_AFTER_HANDOVER_NOTE = "filling invoices"
 # Rows whose hours the schedule does not state are written blank and shaded, so
 # the physician can see at a glance which times still need typing in.
 MANUAL_TIME_ROW_FILL = "FFF2CC"
@@ -1350,24 +1354,24 @@ def build_invoice_rows(
     def window_on(day: date, start: time, end: time) -> tuple[datetime, datetime]:
         return datetime.combine(day, start), datetime.combine(day, end)
 
-    def add_team_handover(handover_date: date, note: str, when: str, first_day: date, last_day: date) -> datetime | None:
-        """Add the team handover, returning its end if it took the usual 18:00-19:00 slot.
+    def add_team_handover(handover_date: date, note: str, when: str, first_day: date, last_day: date) -> None:
+        """Add the team handover, at 18:00-19:00 if that hour is free.
 
         If an evening shift covers 18:00-19:00 the handover moves to the hour
         before it, and if a VIRTUAL shift does, to after it. If the moved slot
         is taken too, or something else covers 18:00-19:00, it is left off.
         """
         if handover_date in team_handover_dates:
-            return None
+            return
         team_handover_dates.add(handover_date)
         if billing_dates and not billing_dates[0] <= handover_date <= billing_dates[1]:
-            return None
+            return
         stretch = f"{first_day.isoformat()} to {last_day.isoformat()}" if first_day != last_day else first_day.isoformat()
         source = f"Team handover, {when} team days {stretch}"
         usual = window_on(handover_date, TEAM_HANDOVER_START, TEAM_HANDOVER_END)
         if not already_billed(*usual):
             add_admin(*usual, site_mode="On-Site", note=note, source=source)
-            return usual[1]
+            return
 
         clashing = [shift for shift in every_shift if overlaps_interval(*usual, [actual_interval(shift)])]
         if any("evening" in shift.admin_categories for shift in clashing):
@@ -1379,21 +1383,22 @@ def build_invoice_rows(
                 f"No team handover on {handover_date.isoformat()} ({when} your team days {stretch}), "
                 f"because you are already billing {format_window(*usual)}."
             )
-            return None
+            return
         if already_billed(*moved):
             skipped_messages.append(
                 f"No team handover on {handover_date.isoformat()} ({when} your team days {stretch}): "
                 f"{format_window(*usual)} clashes with {clash}, and {format_window(*moved)} "
                 "is already billed too."
             )
-            return None
+            return
         add_admin(*moved, site_mode="On-Site", note=note, source=source)
-        return None
 
     for shift in shifts:
         place(shift)
         shift_start, shift_end = actual_interval(shift)
         admin_start = shift_end
+        admin_minutes = ADMIN_MINUTES
+        note = admin_note
 
         minutes, side, label = handover_for(shift, extras)
         if minutes:
@@ -1417,8 +1422,14 @@ def build_invoice_rows(
                     source_cell=shift.source_cell,
                 )
                 if side == "after":
-                    # The clinical admin follows the handover, not the shift.
+                    # The clinical admin follows the handover, not the shift, and
+                    # is shorter because the handover already has its own row. A
+                    # note the physician typed is kept; the default one mentions
+                    # handover, so it is swapped for plain "filling invoices".
                     admin_start = window[1]
+                    admin_minutes = ADMIN_AFTER_HANDOVER_MINUTES
+                    if admin_note == DEFAULT_CLINICAL_ADMIN_NOTE:
+                        note = ADMIN_AFTER_HANDOVER_NOTE
 
         if extras.day_call_prep and shift.on_call:
             window = (
@@ -1442,19 +1453,16 @@ def build_invoice_rows(
 
         if "scheduled" in shift.admin_categories and shift.service_date in stretch_ending_on:
             first_day, last_day = stretch_ending_on[shift.service_date]
-            handover_end = add_team_handover(
+            # The clinical admin stays right after the shift; the hour-long
+            # handover comes later in the evening.
+            add_team_handover(
                 last_day, "Patient handover, end of team day stretch", "the last day of", first_day, last_day
             )
-            if handover_end is not None:
-                # On the last team day, the clinical admin follows the handover.
-                # A handover moved around an evening or VIRTUAL shift does not
-                # carry the admin with it.
-                admin_start = handover_end
 
         if not any(category in enabled_admin_types for category in shift.admin_categories):
             continue
 
-        admin_end = admin_start + timedelta(minutes=ADMIN_MINUTES)
+        admin_end = admin_start + timedelta(minutes=admin_minutes)
         # A shift with no hours on the schedule has no known end, so there is
         # nothing to test the admin window against. The row is still created, and
         # is left blank and highlighted alongside the shift it follows.
@@ -1468,7 +1476,7 @@ def build_invoice_rows(
             admin_start,
             admin_end,
             site_mode=clinical_admin_site_mode(shift),
-            note=admin_note,
+            note=note,
             source=f"Clinical Admin after {shift.source}",
             needs_manual_time=shift.needs_manual_time,
             source_cell=shift.source_cell,
@@ -2310,7 +2318,7 @@ def render_form(
           <label class="check"><input type="checkbox" name="team_stretch_handover" value="1"{flag('team_stretch_handover')}><span>Team day stretch handover<span class="hint">1 h, 18:00&ndash;19:00, the day before your team days start and on the last day. Moves to 15:30&ndash;16:30 if you are on an evening shift then, or 22:00&ndash;23:00 if on VIRTUAL.</span></span></label>
           <label class="check"><input type="checkbox" name="day_call_prep" value="1"{flag('day_call_prep')}><span>Day call prep<span class="hint">06:00&ndash;06:30 before each *C day: printing day lists and billing sheets</span></span></label>
         </div>
-        <p class="hint">{ADMIN_MINUTES}-minute clinical admin: checking a box adds one {ADMIN_MINUTES}-minute entry after each shift of that type, or after the handover when one follows the shift. If it would overlap another billed interval, it is skipped automatically.</p>
+        <p class="hint">{ADMIN_MINUTES}-minute clinical admin: checking a box adds one {ADMIN_MINUTES}-minute entry after each shift of that type. After a night shift handover it follows the handover instead, as {ADMIN_AFTER_HANDOVER_MINUTES} minutes of {ADMIN_AFTER_HANDOVER_NOTE}. If it would overlap another billed interval, it is skipped automatically.</p>
         <div class="checks">
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="scheduled"{checked('scheduled')}>Scheduled / Team</label>
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="evening"{checked('evening')}>Evening</label>

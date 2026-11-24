@@ -133,11 +133,14 @@ handover before it, and a night shift followed by your own day shift gets no
 handover at 07:00. The results page lists every handover that was left off
 and why.
 
-When a handover follows a shift, the 30-minute clinical admin moves to after the
-handover, such as `07:30-08:00` after a night shift, or `19:00-19:30` on the
-last day of a run of team days. Other team days keep it at `17:00-17:30`, and
-so does a last team day whose handover moved around an evening or `VIRTUAL`
-shift.
+After a night shift handover, the clinical admin follows the handover and is
+15 minutes of `filling invoices`, such as `07:30-07:45`, because the handover
+already has its own row. If you typed your own clinical admin note, that note
+is kept. With no night handover, the admin is the usual 30 minutes straight
+after the shift.
+
+On the last day of a run of team days, the clinical admin stays right after the
+shift, `17:00-17:30`, and the team handover follows at `18:00-19:00`.
 
 The app also reads the day either side of the half-month you are invoicing. That
 is how it knows whether a run of team days carries on past the 15th or the end
