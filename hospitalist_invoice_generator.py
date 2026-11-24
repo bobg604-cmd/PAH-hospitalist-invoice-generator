@@ -138,8 +138,7 @@ ADMIN_TYPE_LABELS = {
 # Optional unscheduled clinical admin beyond the 30-minute add-on. The evening
 # handover sits right before the shift starts and the night handover right
 # after it ends; either is left off when the physician is already on shift then.
-HANDOVER_MINUTE_CHOICES = (0, 15, 30)
-DEFAULT_HANDOVER_MINUTES = 30
+HANDOVER_MINUTES = 30
 # A stretch of team day shifts is handed over at a fixed evening time: the day
 # before the stretch starts, and on its last day.
 TEAM_HANDOVER_START = time(18, 0)
@@ -464,16 +463,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evening-handover",
         type=int,
-        choices=HANDOVER_MINUTE_CHOICES,
-        default=DEFAULT_HANDOVER_MINUTES,
-        help=f"Minutes of handover just before each evening shift starts (0, 15 or 30; default {DEFAULT_HANDOVER_MINUTES}).",
+        choices=(0, HANDOVER_MINUTES),
+        default=HANDOVER_MINUTES,
+        help=f"Minutes of handover just before each evening shift starts: {HANDOVER_MINUTES}, or 0 for none (default {HANDOVER_MINUTES}).",
     )
     parser.add_argument(
         "--night-handover",
         type=int,
-        choices=HANDOVER_MINUTE_CHOICES,
-        default=DEFAULT_HANDOVER_MINUTES,
-        help=f"Minutes of handover just after each night shift ends (0, 15 or 30; default {DEFAULT_HANDOVER_MINUTES}).",
+        choices=(0, HANDOVER_MINUTES),
+        default=HANDOVER_MINUTES,
+        help=f"Minutes of handover just after each night shift ends: {HANDOVER_MINUTES}, or 0 for none (default {HANDOVER_MINUTES}).",
     )
     parser.add_argument(
         "--team-stretch-handover",
@@ -2122,13 +2121,9 @@ def render_form(
     def flag(name: str) -> str:
         return " checked" if values.get(name) else ""
 
-    def handover_options(name: str) -> str:
-        selected = values.get(name, str(DEFAULT_HANDOVER_MINUTES))
-        labels = {0: "None", 15: "15 min", 30: "30 min"}
-        return "".join(
-            f'<option value="{minutes}"{" selected" if str(minutes) == selected else ""}>{labels[minutes]}</option>'
-            for minutes in HANDOVER_MINUTE_CHOICES
-        )
+    def flag_on_by_default(name: str) -> str:
+        # Ticked on a fresh form; after a submit, it shows what was sent.
+        return " checked" if values.get(name, "1") else ""
 
     def alert_html(messages: list[str], title: str = "Please fix:") -> str:
         if not messages:
@@ -2304,17 +2299,9 @@ def render_form(
         </div>
         <div class="section-title">Clinical Admin</div>
         <p class="hint">Optional unscheduled clinical admin. A handover is left off automatically when you are already on shift at that time.</p>
-        <div class="two">
-          <label>Evening Shift Handover
-            <select name="evening_handover">{handover_options('evening_handover')}</select>
-            <span class="hint">One entry before the shift: 16:30&ndash;17:00, or 16:45&ndash;17:00 for 15 min.</span>
-          </label>
-          <label>Night Shift Handover
-            <select name="night_handover">{handover_options('night_handover')}</select>
-            <span class="hint">One entry after the shift: 07:00&ndash;07:30, or 07:00&ndash;07:15 for 15 min.</span>
-          </label>
-        </div>
         <div class="checks single">
+          <label class="check"><input type="checkbox" name="evening_handover" value="1"{flag_on_by_default('evening_handover')}><span>Evening shift handover<span class="hint">30 min, 16:30&ndash;17:00, just before each evening shift</span></span></label>
+          <label class="check"><input type="checkbox" name="night_handover" value="1"{flag_on_by_default('night_handover')}><span>Night shift handover<span class="hint">30 min, 07:00&ndash;07:30, just after each night shift</span></span></label>
           <label class="check"><input type="checkbox" name="team_stretch_handover" value="1"{flag('team_stretch_handover')}><span>Team day stretch handover<span class="hint">1 h, 18:00&ndash;19:00, the day before your team days start and on the last day. Moves to 15:30&ndash;16:30 if you are on an evening shift then, or 22:00&ndash;23:00 if on VIRTUAL.</span></span></label>
           <label class="check"><input type="checkbox" name="day_call_prep" value="1"{flag('day_call_prep')}><span>Day call prep<span class="hint">06:00&ndash;06:30 before each *C day: printing day lists and billing sheets</span></span></label>
         </div>
@@ -2881,8 +2868,8 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     period = collect_form_value(data, "period", "first")
     admin_types = parse_admin_type_values(data.get("clinical_admin_type", []))
     admin_extras = ClinicalAdminExtras(
-        evening_handover_minutes=parse_handover_minutes(collect_form_value(data, "evening_handover", str(DEFAULT_HANDOVER_MINUTES))),
-        overnight_handover_minutes=parse_handover_minutes(collect_form_value(data, "night_handover", str(DEFAULT_HANDOVER_MINUTES))),
+        evening_handover_minutes=handover_minutes_from_form(collect_form_value(data, "evening_handover")),
+        overnight_handover_minutes=handover_minutes_from_form(collect_form_value(data, "night_handover")),
         team_stretch_handover=bool(collect_form_value(data, "team_stretch_handover")),
         day_call_prep=bool(collect_form_value(data, "day_call_prep")),
     )
@@ -2938,14 +2925,10 @@ def build_options_from_form(data: dict[str, list[str]], uploaded_template_path: 
     )
 
 
-def parse_handover_minutes(raw_value: str) -> int:
-    try:
-        minutes = int(raw_value or "0")
-    except ValueError as exc:
-        raise ValueError("Handover length must be 0, 15 or 30 minutes.") from exc
-    if minutes not in HANDOVER_MINUTE_CHOICES:
-        raise ValueError("Handover length must be 0, 15 or 30 minutes.")
-    return minutes
+def handover_minutes_from_form(raw_value: str) -> int:
+    # A ticked box sends "1". "0" is what the old None option sent, so a page
+    # loaded before the checkbox change still means no handover.
+    return HANDOVER_MINUTES if raw_value not in ("", "0") else 0
 
 
 def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
@@ -2964,8 +2947,8 @@ def form_values_from_request_data(data: dict[str, list[str]]) -> dict[str, str]:
         "clinical_admin_note": collect_form_value(data, "clinical_admin_note", DEFAULT_CLINICAL_ADMIN_NOTE),
         "master_url": collect_form_value(data, "master_url", DEFAULT_MASTER_URL),
         "clinical_admin_types": ",".join(data.get("clinical_admin_type", [])),
-        "evening_handover": collect_form_value(data, "evening_handover", str(DEFAULT_HANDOVER_MINUTES)),
-        "night_handover": collect_form_value(data, "night_handover", str(DEFAULT_HANDOVER_MINUTES)),
+        "evening_handover": collect_form_value(data, "evening_handover"),
+        "night_handover": collect_form_value(data, "night_handover"),
         "team_stretch_handover": collect_form_value(data, "team_stretch_handover"),
         "day_call_prep": collect_form_value(data, "day_call_prep"),
     }
