@@ -39,7 +39,7 @@ The form will ask for:
 - the month and half of the month
 - whether to add handover time around evening and night shifts, team handovers
   around a run of team days, and day call prep time
-- whether to add 15 minutes of clinical admin after certain shift types
+- whether to add 30 minutes of clinical admin after certain shift types
 
 You can also add schedule aliases if your name appears in more than one way on the schedule.
 
@@ -133,9 +133,9 @@ handover before it, and a night shift followed by your own day shift gets no
 handover at 07:00. The results page lists every handover that was left off
 and why.
 
-When a handover follows a shift, the 15-minute clinical admin moves to after the
-handover, such as `07:30-07:45` after a night shift, or `19:00-19:15` on the
-last day of a run of team days. Other team days keep it at `17:00-17:15`, and
+When a handover follows a shift, the 30-minute clinical admin moves to after the
+handover, such as `07:30-08:00` after a night shift, or `19:00-19:30` on the
+last day of a run of team days. Other team days keep it at `17:00-17:30`, and
 so does a last team day whose handover moved around an evening or `VIRTUAL`
 shift.
 

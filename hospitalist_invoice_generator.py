@@ -67,8 +67,8 @@ CURRENT_TEMPLATE_FIRST_PERIOD = (2026, 10)
 AUTO_TEMPLATE_CHOICE = "__auto__"
 START_ROW = 18
 END_ROW = 217
-ADMIN_MINUTES = 15
-DEFAULT_CLINICAL_ADMIN_NOTE = "filling invoice forms"
+ADMIN_MINUTES = 30
+DEFAULT_CLINICAL_ADMIN_NOTE = "filling invoices and handover to on call physicians"
 # Rows whose hours the schedule does not state are written blank and shaded, so
 # the physician can see at a glance which times still need typing in.
 MANUAL_TIME_ROW_FILL = "FFF2CC"
@@ -131,7 +131,7 @@ ADMIN_TYPE_LABELS = {
     "admit": "ADMIT shifts",
     "virtual": "VIRTUAL shifts",
 }
-# Optional unscheduled clinical admin beyond the 15-minute add-on. The evening
+# Optional unscheduled clinical admin beyond the 30-minute add-on. The evening
 # handover sits right before the shift starts and the night handover right
 # after it ends; either is left off when the physician is already on shift then.
 HANDOVER_MINUTE_CHOICES = (0, 15, 30)
@@ -449,7 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--clinical-admin-type",
         action="append",
         default=[],
-        help="Shift types eligible for one 15-minute clinical admin add-on: scheduled, evening, overnight, admit, virtual.",
+        help=f"Shift types eligible for one {ADMIN_MINUTES}-minute clinical admin add-on: scheduled, evening, overnight, admit, virtual.",
     )
     parser.add_argument(
         "--clinical-admin-note",
@@ -524,7 +524,7 @@ def prompt_for_admin_types(current_values: list[str]) -> set[str]:
     selected: set[str] = set()
     for key, label in ADMIN_TYPE_LABELS.items():
         while True:
-            answer = input(f"Add 15-minute clinical admin after {label}? [y/N]: ").strip().lower()
+            answer = input(f"Add {ADMIN_MINUTES}-minute clinical admin after {label}? [y/N]: ").strip().lower()
             if answer in {"", "n", "no"}:
                 break
             if answer in {"y", "yes"}:
@@ -1416,7 +1416,7 @@ def build_invoice_rows(
                     source_cell=shift.source_cell,
                 )
                 if side == "after":
-                    # The 15-minute admin follows the handover, not the shift.
+                    # The clinical admin follows the handover, not the shift.
                     admin_start = window[1]
 
         if extras.day_call_prep and shift.on_call:
@@ -1445,7 +1445,7 @@ def build_invoice_rows(
                 last_day, "Patient handover, end of team day stretch", "the last day of", first_day, last_day
             )
             if handover_end is not None:
-                # On the last team day, the 15-minute admin follows the handover.
+                # On the last team day, the clinical admin follows the handover.
                 # A handover moved around an evening or VIRTUAL shift does not
                 # carry the admin with it.
                 admin_start = handover_end
@@ -2309,7 +2309,7 @@ def render_form(
           <label class="check"><input type="checkbox" name="team_stretch_handover" value="1"{flag('team_stretch_handover')}><span>Team day stretch handover<span class="hint">1 h, 18:00&ndash;19:00, the day before your team days start and on the last day. Moves to 15:30&ndash;16:30 if you are on an evening shift then, or 22:00&ndash;23:00 if on VIRTUAL.</span></span></label>
           <label class="check"><input type="checkbox" name="day_call_prep" value="1"{flag('day_call_prep')}><span>Day call prep<span class="hint">06:00&ndash;06:30 before each *C day: printing day lists and billing sheets</span></span></label>
         </div>
-        <p class="hint">15-minute clinical admin: checking a box adds one 15-minute entry after each shift of that type, or after the handover when one follows the shift. If it would overlap another billed interval, it is skipped automatically.</p>
+        <p class="hint">{ADMIN_MINUTES}-minute clinical admin: checking a box adds one {ADMIN_MINUTES}-minute entry after each shift of that type, or after the handover when one follows the shift. If it would overlap another billed interval, it is skipped automatically.</p>
         <div class="checks">
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="scheduled"{checked('scheduled')}>Scheduled / Team</label>
           <label class="check"><input type="checkbox" name="clinical_admin_type" value="evening"{checked('evening')}>Evening</label>
