@@ -131,14 +131,20 @@ ADMIN_TYPE_LABELS = {
     "admit": "ADMIT shifts",
     "virtual": "VIRTUAL shifts",
 }
-# Optional unscheduled clinical admin beyond the 15-minute add-on. Evening and
-# night handovers sit right against the shift, before it starts and after it
-# ends, and are left off when the physician is already on shift at that time.
+# Optional unscheduled clinical admin beyond the 15-minute add-on. The evening
+# handover sits right before the shift starts and the night handover right
+# after it ends; either is left off when the physician is already on shift then.
 HANDOVER_MINUTE_CHOICES = (0, 15, 30)
 # A stretch of team day shifts is handed over at a fixed evening time: the day
 # before the stretch starts, and on its last day.
 TEAM_HANDOVER_START = time(18, 0)
 TEAM_HANDOVER_END = time(19, 0)
+# When the physician is on an evening shift at 18:00-19:00, the team handover
+# moves to the hour before it, leaving 16:30-17:00 free for the evening
+# shift's own handover. When it is a VIRTUAL shift instead, the handover moves
+# to after it.
+TEAM_HANDOVER_BEFORE_EVENING = (time(15, 30), time(16, 30))
+TEAM_HANDOVER_AFTER_VIRTUAL = (time(22, 0), time(23, 0))
 # The on-call day doctor prints the day lists and billing sheets before 06:30.
 DAY_CALL_PREP_START = time(6, 0)
 DAY_CALL_PREP_END = time(6, 30)
@@ -455,19 +461,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=HANDOVER_MINUTE_CHOICES,
         default=0,
-        help="Minutes of handover before and after each evening shift (0, 15 or 30).",
+        help="Minutes of handover just before each evening shift starts (0, 15 or 30).",
     )
     parser.add_argument(
         "--night-handover",
         type=int,
         choices=HANDOVER_MINUTE_CHOICES,
         default=0,
-        help="Minutes of handover before and after each night shift (0, 15 or 30).",
+        help="Minutes of handover just after each night shift ends (0, 15 or 30).",
     )
     parser.add_argument(
         "--team-stretch-handover",
         action="store_true",
-        help="Add a 1-hour 18:00-19:00 handover the day before a stretch of team day shifts and on its last day.",
+        help="Add a 1-hour 18:00-19:00 handover the day before a stretch of team day shifts and on its last day "
+        "(15:30-16:30 if on an evening shift then, 22:00-23:00 if on VIRTUAL).",
     )
     parser.add_argument(
         "--day-call-prep",
@@ -1262,12 +1269,17 @@ def clinical_admin_row(
     )
 
 
-def handover_minutes_for(shift: ShiftEntry, extras: ClinicalAdminExtras) -> tuple[int, str]:
+def handover_for(shift: ShiftEntry, extras: ClinicalAdminExtras) -> tuple[int, str, str]:
+    """Minutes, side and label of the handover a shift earns, if any.
+
+    The evening doctor takes handover before the shift starts; the night
+    doctor gives handover after the shift ends.
+    """
     if "evening" in shift.admin_categories:
-        return extras.evening_handover_minutes, "evening shift"
+        return extras.evening_handover_minutes, "before", "evening shift"
     if "overnight" in shift.admin_categories:
-        return extras.overnight_handover_minutes, "night shift"
-    return 0, ""
+        return extras.overnight_handover_minutes, "after", "night shift"
+    return 0, "", ""
 
 
 def team_day_stretches(shifts: Iterable[ShiftEntry]) -> list[tuple[date, date]]:
@@ -1312,7 +1324,8 @@ def build_invoice_rows(
     """
     extras = extras or ClinicalAdminExtras()
     context_shifts = list(context_shifts)
-    shift_intervals = [actual_interval(shift) for shift in list(shifts) + context_shifts]
+    every_shift = list(shifts) + context_shifts
+    shift_intervals = [actual_interval(shift) for shift in every_shift]
     added_admin_rows: list[ShiftEntry] = []
     skipped_messages: list[str] = []
     timeline: list[tuple[datetime, int, ShiftEntry]] = []
@@ -1329,49 +1342,71 @@ def build_invoice_rows(
         added_admin_rows.append(row)
         place(row)
 
-    stretches = team_day_stretches(list(shifts) + context_shifts) if extras.team_stretch_handover else []
+    stretches = team_day_stretches(every_shift) if extras.team_stretch_handover else []
     stretch_ending_on = {last_day: (first_day, last_day) for first_day, last_day in stretches}
     team_handover_dates: set[date] = set()
 
+    def window_on(day: date, start: time, end: time) -> tuple[datetime, datetime]:
+        return datetime.combine(day, start), datetime.combine(day, end)
+
     def add_team_handover(handover_date: date, note: str, when: str, first_day: date, last_day: date) -> datetime | None:
-        """Add the 18:00-19:00 team handover, returning its end, or None if it is skipped."""
+        """Add the team handover, returning its end if it took the usual 18:00-19:00 slot.
+
+        If an evening shift covers 18:00-19:00 the handover moves to the hour
+        before it, and if a VIRTUAL shift does, to after it. If the moved slot
+        is taken too, or something else covers 18:00-19:00, it is left off.
+        """
         if handover_date in team_handover_dates:
             return None
         team_handover_dates.add(handover_date)
         if billing_dates and not billing_dates[0] <= handover_date <= billing_dates[1]:
             return None
         stretch = f"{first_day.isoformat()} to {last_day.isoformat()}" if first_day != last_day else first_day.isoformat()
-        window = (
-            datetime.combine(handover_date, TEAM_HANDOVER_START),
-            datetime.combine(handover_date, TEAM_HANDOVER_END),
-        )
-        if already_billed(*window):
+        source = f"Team handover, {when} team days {stretch}"
+        usual = window_on(handover_date, TEAM_HANDOVER_START, TEAM_HANDOVER_END)
+        if not already_billed(*usual):
+            add_admin(*usual, site_mode="On-Site", note=note, source=source)
+            return usual[1]
+
+        clashing = [shift for shift in every_shift if overlaps_interval(*usual, [actual_interval(shift)])]
+        if any("evening" in shift.admin_categories for shift in clashing):
+            moved, clash = window_on(handover_date, *TEAM_HANDOVER_BEFORE_EVENING), "your evening shift"
+        elif any("virtual" in shift.admin_categories for shift in clashing):
+            moved, clash = window_on(handover_date, *TEAM_HANDOVER_AFTER_VIRTUAL), "your VIRTUAL shift"
+        else:
             skipped_messages.append(
-                f"No team handover on {handover_date.isoformat()} ({format_window(*window)}, {when} "
-                f"your team days {stretch}), because you are already billing that time."
+                f"No team handover on {handover_date.isoformat()} ({when} your team days {stretch}), "
+                f"because you are already billing {format_window(*usual)}."
             )
             return None
-        add_admin(*window, site_mode="On-Site", note=note, source=f"Team handover, {when} team days {stretch}")
-        return window[1]
+        if already_billed(*moved):
+            skipped_messages.append(
+                f"No team handover on {handover_date.isoformat()} ({when} your team days {stretch}): "
+                f"{format_window(*usual)} clashes with {clash}, and {format_window(*moved)} "
+                "is already billed too."
+            )
+            return None
+        add_admin(*moved, site_mode="On-Site", note=note, source=source)
+        return None
 
     for shift in shifts:
         place(shift)
         shift_start, shift_end = actual_interval(shift)
         admin_start = shift_end
 
-        minutes, label = handover_minutes_for(shift, extras)
+        minutes, side, label = handover_for(shift, extras)
         if minutes:
             length = timedelta(minutes=minutes)
-            for side, window in (
-                ("before", (shift_start - length, shift_start)),
-                ("after", (shift_end, shift_end + length)),
-            ):
-                if already_billed(*window):
-                    skipped_messages.append(
-                        f"No handover {side} the {describe_shift(shift)} shift ({format_window(*window)}), "
-                        "because you are already billing that time."
-                    )
-                    continue
+            if side == "before":
+                window = (shift_start - length, shift_start)
+            else:
+                window = (shift_end, shift_end + length)
+            if already_billed(*window):
+                skipped_messages.append(
+                    f"No handover {side} the {describe_shift(shift)} shift ({format_window(*window)}), "
+                    "because you are already billing that time."
+                )
+            else:
                 add_admin(
                     *window,
                     site_mode=clinical_admin_site_mode(shift),
@@ -1411,6 +1446,8 @@ def build_invoice_rows(
             )
             if handover_end is not None:
                 # On the last team day, the 15-minute admin follows the handover.
+                # A handover moved around an evening or VIRTUAL shift does not
+                # carry the admin with it.
                 admin_start = handover_end
 
         if not any(category in enabled_admin_types for category in shift.admin_categories):
@@ -2257,19 +2294,19 @@ def render_form(
           </label>
         </div>
         <div class="section-title">Clinical Admin</div>
-        <p class="hint">Optional unscheduled clinical admin. A handover is left off automatically when you are already on shift right before or after it.</p>
+        <p class="hint">Optional unscheduled clinical admin. A handover is left off automatically when you are already on shift at that time.</p>
         <div class="two">
           <label>Evening Shift Handover
             <select name="evening_handover">{handover_options('evening_handover')}</select>
-            <span class="hint">Before and after the shift, e.g. 16:30&ndash;17:00 and 00:00&ndash;00:30.</span>
+            <span class="hint">One entry before the shift: 16:30&ndash;17:00, or 16:45&ndash;17:00 for 15 min.</span>
           </label>
           <label>Night Shift Handover
             <select name="night_handover">{handover_options('night_handover')}</select>
-            <span class="hint">Before and after the shift, e.g. 23:30&ndash;00:00 and 07:00&ndash;07:30.</span>
+            <span class="hint">One entry after the shift: 07:00&ndash;07:30, or 07:00&ndash;07:15 for 15 min.</span>
           </label>
         </div>
         <div class="checks single">
-          <label class="check"><input type="checkbox" name="team_stretch_handover" value="1"{flag('team_stretch_handover')}><span>Team day stretch handover<span class="hint">1 h, 18:00&ndash;19:00, the day before your team days start and on the last day</span></span></label>
+          <label class="check"><input type="checkbox" name="team_stretch_handover" value="1"{flag('team_stretch_handover')}><span>Team day stretch handover<span class="hint">1 h, 18:00&ndash;19:00, the day before your team days start and on the last day. Moves to 15:30&ndash;16:30 if you are on an evening shift then, or 22:00&ndash;23:00 if on VIRTUAL.</span></span></label>
           <label class="check"><input type="checkbox" name="day_call_prep" value="1"{flag('day_call_prep')}><span>Day call prep<span class="hint">06:00&ndash;06:30 before each *C day: printing day lists and billing sheets</span></span></label>
         </div>
         <p class="hint">15-minute clinical admin: checking a box adds one 15-minute entry after each shift of that type, or after the handover when one follows the shift. If it would overlap another billed interval, it is skipped automatically.</p>

@@ -115,23 +115,29 @@ The Clinical Admin section of the form has some optional extras. Each one is
 billed as `Non-Scheduled` `Clinical Admin`, and never overlaps time you are
 already billing.
 
-- **Evening shift handover** (15 or 30 minutes): before the shift, such as
-  `16:30-17:00`, and after it, such as `00:00-00:30`
-- **Night shift handover** (15 or 30 minutes): before the shift, such as
-  `23:30-00:00`, and after it, such as `07:00-07:30`
+- **Evening shift handover** (15 or 30 minutes): one entry just before the
+  shift, such as `16:30-17:00`
+- **Night shift handover** (15 or 30 minutes): one entry just after the
+  shift, such as `07:00-07:30`
 - **Team day stretch handover**: one hour, `18:00-19:00`, on the day before you
-  start a run of team day shifts, and again on the last day of that run
+  start a run of team day shifts, and again on the last day of that run. If you
+  are on an evening shift at that time it moves to `15:30-16:30`, leaving time
+  for the evening handover; if you are on a `VIRTUAL` shift it moves to
+  `22:00-23:00`. If the new time is taken too, it is left off
 - **Day call prep**: `06:00-06:30` before each `*C` day shift, noted as
   `printing day lists and billing sheets`
 
-A handover is left off when you are already on shift right before or after it.
-For example, an evening shift followed by your own overnight gets no handover
-at midnight, and a night shift followed by your own day shift gets no handover
-at 07:00. The results page lists every handover that was left off and why.
+A handover is left off when you are already on shift at that time. For
+example, an evening shift straight after your own day or ADMIT shift gets no
+handover before it, and a night shift followed by your own day shift gets no
+handover at 07:00. The results page lists every handover that was left off
+and why.
 
 When a handover follows a shift, the 15-minute clinical admin moves to after the
-handover, such as `00:30-00:45` after an evening shift, or `19:00-19:15` on the
-last day of a run of team days. Other team days keep it at `17:00-17:15`.
+handover, such as `07:30-07:45` after a night shift, or `19:00-19:15` on the
+last day of a run of team days. Other team days keep it at `17:00-17:15`, and
+so does a last team day whose handover moved around an evening or `VIRTUAL`
+shift.
 
 The app also reads the day either side of the half-month you are invoicing. That
 is how it knows whether a run of team days carries on past the 15th or the end
